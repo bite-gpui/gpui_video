@@ -5,14 +5,19 @@
 //! stands in for — is a hardware-decoded `NV12` surface: the VA driver allocates it, a decoder writes
 //! it, and `vaExportSurfaceHandle` hands out the object the renderer imports.
 //!
+//! Two producers make that shape. [`decode`] and [`Decoder`] drive libavcodec over the VA-API device,
+//! one exported surface per frame, which is the real thing a video player uses; [`nv12`] hand-fills a
+//! surface on the GPU with a flat colour, and stands in where libavcodec is not installed. Both are
+//! reached by a client that knows the producer is Linux-only and reaches it behind `#[cfg]`.
+//!
 //! A decoded surface is **tiled** (here `I915_FORMAT_MOD_Y_TILED`), which the renderer accepts only
 //! because its device enables `VK_EXT_image_drm_format_modifier`; see `gpui_wgpu`'s device creation.
 //! The surface's memory is not the CPU's to write — iHD maps none of it and refuses `vaPutImage` with
-//! `VA_STATUS_ERROR_SURFACE_BUSY` — so the fixture is filled on the GPU, by importing the exported
-//! object into a Vulkan device and copying into it, which is what a decoder would do with real
+//! `VA_STATUS_ERROR_SURFACE_BUSY` — so the stand-in fills its surface on the GPU, by importing the
+//! exported object into a Vulkan device and copying into it, which is what a decoder does with a real
 //! bitstream.
 //!
-//! `libva` is opened at run time, so a machine without the driver builds and skips.
+//! `libva` and `libavcodec` are opened at run time, so a machine without them builds and skips.
 
 #![cfg(target_os = "linux")]
 
@@ -66,15 +71,20 @@ fn nv12_from_rgb(rgb: [u8; 4]) -> (u8, u8, u8) {
 /// encode would instead arrive as washed-out bars.
 pub const FIXTURE: &[u8] = include_bytes!("../fixtures/testcard.h264");
 
-/// Decode `bitstream` on the GPU and export the decoded surface for the renderer.
+/// The player demo's clip: the same bars, 60 frames at 256×144 (about two seconds), scrolled a few
+/// pixels per frame so the frames differ and the stream carries real inter-frame (`P`) frames. It is
+/// small enough to carry in-tree and decoded the same way a real stream is.
+pub const CLIP: &[u8] = include_bytes!("../fixtures/clip.h264");
+
+/// Decode the first frame of `bitstream` on the GPU and export its surface for the renderer.
 ///
 /// `None` when libavcodec of the declared ABI is not installed, or the stream does not decode: the
-/// surface path then simply has nothing to composite.
-pub fn decode(bitstream: &[u8]) -> Option<(Decoded, DmaBufHandle)> {
+/// surface path then simply has nothing to composite. A player drives [`Decoder`] directly instead.
+pub fn decode(bitstream: &[u8]) -> Option<Frame> {
     codec::decode(bitstream)
 }
 
-pub use codec::Decoded;
+pub use codec::{Decoder, Frame};
 
 /// Fill a tiled `Nv12` dma-buf with `colour`, on the GPU.
 ///
@@ -529,17 +539,23 @@ mod ffmpeg {
     }
 }
 
-/// The libavcodec decode: a bitstream in, a VA surface out, gated on the ABI the declarations target.
+/// The libavcodec decode: a bitstream in, a VA surface per frame out, gated on the ABI the
+/// declarations target.
 ///
 /// A decoder writes into a hardware surface the VA driver allocates, and `frame->data[3]` carries
 /// that surface's id; the surface is then exported by the same path the stand-in uses, so the tiled
-/// `Nv12` object reaches the renderer identically. Only `AVCodecContext::hw_device_ctx` is touched,
-/// and the offset asserts below are the layout `clang` reports for ffmpeg 8.0.
+/// `Nv12` object reaches the renderer identically. The elementary stream is split into access units
+/// with `av_parser_parse2` — a whole stream in one `avcodec_send_packet` decodes only its first frame
+/// — and each frame the decoder yields carries its surface until the [`Frame`] is dropped. Only
+/// `AVCodecContext::hw_device_ctx` is touched, and the offset asserts below are the layout `clang`
+/// reports for ffmpeg 8.0.
 mod codec {
     #![allow(unsafe_op_in_unsafe_fn)]
 
+    use std::collections::VecDeque;
     use std::ffi::{c_char, c_int, c_void};
     use std::ptr;
+    use std::sync::Arc;
 
     use gpui_engine::DmaBufHandle;
 
@@ -547,6 +563,10 @@ mod codec {
     use super::va;
 
     const AV_HWDEVICE_TYPE_VAAPI: c_int = 3;
+    /// `AV_CODEC_ID_H264`, a stable enum value in libavcodec.
+    const AV_CODEC_ID_H264: c_int = 27;
+    /// `AV_NOPTS_VALUE`: the parser needs a timestamp, and the streams here carry none.
+    const AV_NOPTS_VALUE: i64 = i64::MIN;
 
     #[repr(C)]
     struct AvBufferRef {
@@ -616,6 +636,19 @@ mod codec {
     type FrameFree = unsafe extern "C" fn(*mut *mut AvFrame);
     type BufferRef = unsafe extern "C" fn(*mut AvBufferRef) -> *mut AvBufferRef;
     type BufferUnref = unsafe extern "C" fn(*mut *mut AvBufferRef);
+    type ParserInit = unsafe extern "C" fn(c_int) -> *mut c_void;
+    type ParserParse2 = unsafe extern "C" fn(
+        *mut c_void,
+        *mut AvCodecContext,
+        *mut *mut u8,
+        *mut c_int,
+        *const u8,
+        c_int,
+        i64,
+        i64,
+        i64,
+    ) -> c_int;
+    type ParserClose = unsafe extern "C" fn(*mut c_void);
 
     /// The libavcodec/libavutil functions the decode calls, each resolved under the ABI version tag.
     #[derive(Clone, Copy)]
@@ -634,6 +667,9 @@ mod codec {
         frame_free: FrameFree,
         buffer_ref: BufferRef,
         buffer_unref: BufferUnref,
+        parser_init: ParserInit,
+        parser_parse2: ParserParse2,
+        parser_close: ParserClose,
     }
 
     impl Symbols {
@@ -663,112 +699,254 @@ mod codec {
                 frame_free: symbol(libs, true, "av_frame_free")?,
                 buffer_ref: symbol(libs, true, "av_buffer_ref")?,
                 buffer_unref: symbol(libs, true, "av_buffer_unref")?,
+                parser_init: symbol(libs, false, "av_parser_init")?,
+                parser_parse2: symbol(libs, false, "av_parser_parse2")?,
+                parser_close: symbol(libs, false, "av_parser_close")?,
             })
         }
     }
 
-    /// A decoded surface, and everything that must outlive the dma-buf exported from it.
-    pub struct Decoded {
-        _libs: Ffmpeg,
+    /// A long-lived decode: the libavcodec context, the VA-API device under it, and the parser that
+    /// splits the elementary stream into access units, all kept across frames so a video decodes as a
+    /// stream rather than one shot.
+    pub struct Decoder {
+        libs: Arc<Ffmpeg>,
         symbols: Symbols,
-        frame: *mut AvFrame,
-        packet: *mut AvPacket,
+        parser: *mut c_void,
         context: *mut AvCodecContext,
         hw_device: *mut AvBufferRef,
+        packet: *mut AvPacket,
+        /// The VA display `hw_device` owns, which the surface export needs.
+        display: *mut c_void,
+        /// Frames pulled from the decoder and not yet handed out. Draining after each access unit is
+        /// what keeps `avcodec_send_packet` from returning `EAGAIN`.
+        queue: VecDeque<Frame>,
     }
 
-    impl Drop for Decoded {
-        fn drop(&mut self) {
-            // SAFETY: each pointer is one this decode allocated; each free accepts a null pointer, and
-            // the frame goes before the context so its surface is returned before the decoder dies.
+    impl Decoder {
+        /// Open a decoder over the VA-API device, or `None` where libavcodec of the declared ABI, or
+        /// the device, is unavailable.
+        pub fn open() -> Option<Self> {
+            let libs = Arc::new(super::ffmpeg::load()?);
+            let symbols = Symbols::resolve(&libs)?;
+            match unsafe { Self::open_inner(libs, symbols) } {
+                Ok(decoder) => Some(decoder),
+                Err(error) => {
+                    log::warn!("gpui_va: opening the decoder: {error:#}");
+                    None
+                }
+            }
+        }
+
+        unsafe fn open_inner(libs: Arc<Ffmpeg>, symbols: Symbols) -> anyhow::Result<Self> {
+            let mut decoder = Self {
+                libs,
+                symbols,
+                parser: ptr::null_mut(),
+                context: ptr::null_mut(),
+                hw_device: ptr::null_mut(),
+                packet: ptr::null_mut(),
+                display: ptr::null_mut(),
+                queue: VecDeque::new(),
+            };
+            // From here any `?` drops `decoder`, freeing whatever has been built.
+            let symbols = decoder.symbols;
+            anyhow::ensure!(
+                (symbols.hwdevice_ctx_create)(
+                    &mut decoder.hw_device,
+                    AV_HWDEVICE_TYPE_VAAPI,
+                    c"/dev/dri/renderD128".as_ptr(),
+                    ptr::null_mut(),
+                    0,
+                ) >= 0,
+                "av_hwdevice_ctx_create failed"
+            );
+            anyhow::ensure!(!decoder.hw_device.is_null(), "no hardware device");
+
+            // ffmpeg owns the VA display, and the export needs the same one.
+            let device_context = (*decoder.hw_device).data as *mut AvHwDeviceContext;
+            anyhow::ensure!(!device_context.is_null(), "the device has no context");
+            let vaapi = (*device_context).hwctx as *mut AvVaapiDeviceContext;
+            anyhow::ensure!(!vaapi.is_null(), "the device has no VA-API context");
+            decoder.display = (*vaapi).display;
+            anyhow::ensure!(!decoder.display.is_null(), "the VA-API device has no display");
+
+            let codec = (symbols.find_decoder_by_name)(c"h264".as_ptr());
+            anyhow::ensure!(!codec.is_null(), "no h264 decoder");
+            decoder.context = (symbols.alloc_context3)(codec);
+            anyhow::ensure!(!decoder.context.is_null(), "avcodec_alloc_context3 failed");
+            (*decoder.context).hw_device_ctx = (symbols.buffer_ref)(decoder.hw_device);
+            anyhow::ensure!(
+                (symbols.open2)(decoder.context, codec, ptr::null_mut()) >= 0,
+                "avcodec_open2 failed"
+            );
+
+            decoder.parser = (symbols.parser_init)(AV_CODEC_ID_H264);
+            anyhow::ensure!(!decoder.parser.is_null(), "av_parser_init failed");
+            decoder.packet = (symbols.packet_alloc)();
+            anyhow::ensure!(!decoder.packet.is_null(), "av_packet_alloc failed");
+            Ok(decoder)
+        }
+
+        /// Feed `chunk` of the elementary stream: its access units are parsed out and sent to the
+        /// decoder, ready for [`Decoder::receive`].
+        pub fn send(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+            let mut data = chunk;
+            while !data.is_empty() {
+                let (out, out_size, used) = self.parse(data)?;
+                data = &data[used as usize..];
+                if out_size > 0 {
+                    self.send_access_unit(out, out_size)?;
+                }
+            }
+            Ok(())
+        }
+
+        /// End the stream: the parser's last access unit is only emitted now, then the decoder is
+        /// flushed. After this, drain [`Decoder::receive`] until it yields `None`.
+        pub fn finish(&mut self) -> anyhow::Result<()> {
+            loop {
+                let (out, out_size, _) = self.parse(&[])?;
+                if out_size <= 0 {
+                    break;
+                }
+                self.send_access_unit(out, out_size)?;
+            }
+            unsafe { (self.symbols.send_packet)(self.context, ptr::null()) };
+            self.pump();
+            Ok(())
+        }
+
+        fn parse(&mut self, data: &[u8]) -> anyhow::Result<(*mut u8, c_int, c_int)> {
+            let mut out: *mut u8 = ptr::null_mut();
+            let mut out_size: c_int = 0;
+            // An empty slice flushes the parser, which is how the last access unit is emitted.
+            let (buf, len) = if data.is_empty() {
+                (ptr::null(), 0)
+            } else {
+                (data.as_ptr(), data.len() as c_int)
+            };
+            let used = unsafe {
+                (self.symbols.parser_parse2)(
+                    self.parser,
+                    self.context,
+                    &mut out,
+                    &mut out_size,
+                    buf,
+                    len,
+                    AV_NOPTS_VALUE,
+                    AV_NOPTS_VALUE,
+                    0,
+                )
+            };
+            anyhow::ensure!(used >= 0, "av_parser_parse2 failed");
+            Ok((out, out_size, used))
+        }
+
+        fn send_access_unit(&mut self, data: *mut u8, size: c_int) -> anyhow::Result<()> {
             unsafe {
-                (self.symbols.frame_free)(&mut self.frame);
+                anyhow::ensure!(
+                    (self.symbols.new_packet)(self.packet, size) >= 0,
+                    "av_new_packet failed"
+                );
+                ptr::copy_nonoverlapping(data, (*self.packet).data, size as usize);
+                anyhow::ensure!(
+                    (self.symbols.send_packet)(self.context, self.packet) >= 0,
+                    "avcodec_send_packet failed"
+                );
+            }
+            // Drain what this access unit produced, so the next send is accepted.
+            self.pump();
+            Ok(())
+        }
+
+        /// The next decoded frame, or `None` once the queue is drained.
+        pub fn receive(&mut self) -> Option<Frame> {
+            self.queue.pop_front()
+        }
+
+        /// Pull every frame the decoder has ready into the queue.
+        fn pump(&mut self) {
+            while let Some(frame) = self.decode_one() {
+                self.queue.push_back(frame);
+            }
+        }
+
+        /// One `receive_frame`, exported; `None` when the decoder has nothing more right now.
+        fn decode_one(&mut self) -> Option<Frame> {
+            let frame = unsafe { (self.symbols.frame_alloc)() };
+            if frame.is_null() {
+                return None;
+            }
+            let mut frame = frame;
+            if unsafe { (self.symbols.receive_frame)(self.context, frame) } < 0 {
+                unsafe { (self.symbols.frame_free)(&mut frame) };
+                return None;
+            }
+            let surface = unsafe { (*frame).data[3] as usize as u32 };
+            match va::export(self.display, surface) {
+                Ok(handle) => Some(Frame {
+                    _libs: self.libs.clone(),
+                    symbols: self.symbols,
+                    frame,
+                    handle,
+                }),
+                Err(error) => {
+                    log::warn!("gpui_va: exporting a decoded surface: {error:#}");
+                    unsafe { (self.symbols.frame_free)(&mut frame) };
+                    None
+                }
+            }
+        }
+    }
+
+    impl Drop for Decoder {
+        fn drop(&mut self) {
+            // SAFETY: each pointer is one this decoder made; each free accepts a null pointer.
+            unsafe {
                 (self.symbols.packet_free)(&mut self.packet);
+                (self.symbols.parser_close)(self.parser);
                 (self.symbols.free_context)(&mut self.context);
                 (self.symbols.buffer_unref)(&mut self.hw_device);
             }
         }
     }
 
-    /// Decode `bitstream` into a VA surface and export it.
-    pub fn decode(bitstream: &[u8]) -> Option<(Decoded, DmaBufHandle)> {
-        let libs = super::ffmpeg::load()?;
-        let symbols = Symbols::resolve(&libs)?;
-        match unsafe { run(libs, symbols, bitstream) } {
-            Ok(decoded) => Some(decoded),
-            Err(error) => {
-                log::warn!("gpui_va: decode failed: {error:#}");
-                None
-            }
+    /// One decoded frame: its exported dma-buf, and the `AVFrame` that pins the VA surface behind it.
+    ///
+    /// A `Frame` is self-contained — the `AVFrame` references the surface, its pool, the device and
+    /// the display — so it may outlive the [`Decoder`] it came from, and the renderer may sample its
+    /// dma-buf for as long as the frame is held.
+    pub struct Frame {
+        _libs: Arc<Ffmpeg>,
+        symbols: Symbols,
+        frame: *mut AvFrame,
+        handle: DmaBufHandle,
+    }
+
+    impl Frame {
+        /// The dma-buf the renderer imports.
+        pub fn handle(&self) -> &DmaBufHandle {
+            &self.handle
         }
     }
 
-    unsafe fn run(
-        libs: Ffmpeg,
-        symbols: Symbols,
-        bitstream: &[u8],
-    ) -> anyhow::Result<(Decoded, DmaBufHandle)> {
-        let mut decoded = Decoded {
-            _libs: libs,
-            symbols,
-            frame: ptr::null_mut(),
-            packet: ptr::null_mut(),
-            context: ptr::null_mut(),
-            hw_device: ptr::null_mut(),
-        };
-        // From here any `?` drops `decoded`, freeing whatever has been built.
-        anyhow::ensure!(
-            (symbols.hwdevice_ctx_create)(
-                &mut decoded.hw_device,
-                AV_HWDEVICE_TYPE_VAAPI,
-                c"/dev/dri/renderD128".as_ptr(),
-                ptr::null_mut(),
-                0,
-            ) >= 0,
-            "av_hwdevice_ctx_create failed"
-        );
-        anyhow::ensure!(!decoded.hw_device.is_null(), "no hardware device");
+    impl Drop for Frame {
+        fn drop(&mut self) {
+            // SAFETY: the frame is one this decoder allocated; the free returns its surface to the pool.
+            unsafe { (self.symbols.frame_free)(&mut self.frame) };
+        }
+    }
 
-        // ffmpeg owns the VA display, and the export needs the same one.
-        let device_context = (*decoded.hw_device).data as *mut AvHwDeviceContext;
-        anyhow::ensure!(!device_context.is_null(), "the device has no context");
-        let vaapi = (*device_context).hwctx as *mut AvVaapiDeviceContext;
-        anyhow::ensure!(!vaapi.is_null(), "the device has no VA-API context");
-        let display = (*vaapi).display;
-        anyhow::ensure!(!display.is_null(), "the VA-API device has no display");
-
-        let codec = (symbols.find_decoder_by_name)(c"h264".as_ptr());
-        anyhow::ensure!(!codec.is_null(), "no h264 decoder");
-        decoded.context = (symbols.alloc_context3)(codec);
-        anyhow::ensure!(!decoded.context.is_null(), "avcodec_alloc_context3 failed");
-        (*decoded.context).hw_device_ctx = (symbols.buffer_ref)(decoded.hw_device);
-        anyhow::ensure!(
-            (symbols.open2)(decoded.context, codec, ptr::null_mut()) >= 0,
-            "avcodec_open2 failed"
-        );
-
-        decoded.packet = (symbols.packet_alloc)();
-        anyhow::ensure!(!decoded.packet.is_null(), "av_packet_alloc failed");
-        anyhow::ensure!(
-            (symbols.new_packet)(decoded.packet, bitstream.len() as c_int) >= 0,
-            "av_new_packet failed"
-        );
-        ptr::copy_nonoverlapping(bitstream.as_ptr(), (*decoded.packet).data, bitstream.len());
-        anyhow::ensure!(
-            (symbols.send_packet)(decoded.context, decoded.packet) >= 0,
-            "avcodec_send_packet failed"
-        );
-
-        decoded.frame = (symbols.frame_alloc)();
-        anyhow::ensure!(!decoded.frame.is_null(), "av_frame_alloc failed");
-        anyhow::ensure!(
-            (symbols.receive_frame)(decoded.context, decoded.frame) >= 0,
-            "the stream did not decode"
-        );
-        let surface = (*decoded.frame).data[3] as usize as u32;
-
-        let handle = va::export(display, surface)?;
-        Ok((decoded, handle))
+    /// Decode the first frame of `bitstream`, one shot: the whole stream is fed and the first frame
+    /// returned. The fixture and the surface tests use this; a player drives [`Decoder`] directly.
+    pub fn decode(bitstream: &[u8]) -> Option<Frame> {
+        let mut decoder = Decoder::open()?;
+        if let Err(error) = decoder.send(bitstream).and_then(|()| decoder.finish()) {
+            log::warn!("gpui_va: decode failed: {error:#}");
+            return None;
+        }
+        decoder.receive()
     }
 }
 
@@ -996,12 +1174,13 @@ mod tests {
     /// into a tiled NV12 surface, which is what the renderer composites.
     #[test]
     fn the_fixture_decodes_to_a_tiled_surface() {
-        let Some((_decoded, handle)) = decode(FIXTURE) else {
+        let Some(frame) = decode(FIXTURE) else {
             eprintln!(
                 "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
             );
             return;
         };
+        let handle = frame.handle();
         assert_eq!((handle.width, handle.height), (128, 128));
         assert_ne!(
             handle.modifier,
@@ -1009,5 +1188,29 @@ mod tests {
             "a decoded surface is tiled"
         );
         assert_eq!(handle.plane_count(), 2);
+    }
+
+    /// A stream, decoded frame by frame: every frame exports its own tiled surface, and holding them
+    /// all — as a player must, so none is recycled while the renderer samples it — keeps them valid.
+    #[test]
+    fn a_clip_decodes_to_one_tiled_surface_per_frame() {
+        let Some(mut decoder) = Decoder::open() else {
+            eprintln!(
+                "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
+            );
+            return;
+        };
+        decoder.send(CLIP).expect("feed the clip");
+        decoder.finish().expect("finish the clip");
+
+        let mut frames = Vec::new();
+        while let Some(frame) = decoder.receive() {
+            let handle = frame.handle();
+            assert_eq!((handle.width, handle.height), (256, 144));
+            assert_ne!(handle.modifier, DmaBufHandle::LINEAR, "a decoded frame is tiled");
+            frames.push(frame);
+        }
+
+        assert_eq!(frames.len(), 60, "the clip is 60 frames");
     }
 }
