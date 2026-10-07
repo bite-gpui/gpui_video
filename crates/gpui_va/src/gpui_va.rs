@@ -1039,7 +1039,7 @@ mod va {
     use std::ffi::c_void;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    use gpui_engine::{DmaBufFormat, DmaBufHandle, DmaBufPlane};
+    use gpui_engine::{DmaBufHandle, DmaBufPlane, SurfaceFormatKind};
     use libloading::Library;
 
     // The C layouts, as `va/va.h` and `va/va_drmcommon.h` declare them.
@@ -1236,7 +1236,7 @@ mod va {
         Ok(DmaBufHandle::new(
             descriptor.width,
             descriptor.height,
-            DmaBufFormat::Nv12,
+            SurfaceFormatKind::nv12(),
             object.drm_format_modifier,
             [
                 DmaBufPlane::new(fd, u64::from(luma.offset[0]), luma.pitch[0]),
