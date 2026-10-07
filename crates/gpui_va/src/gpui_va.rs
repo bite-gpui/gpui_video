@@ -17,6 +17,9 @@
 //! exported object into a Vulkan device and copying into it, which is what a decoder does with a real
 //! bitstream.
 //!
+//! The decoder also reads each stream's colour space and declares it on the exported handle, so the
+//! renderer converts the bytes with the stream's own matrix and range rather than one assumed.
+//!
 //! `libva` and `libavcodec` are opened at run time, so a machine without them builds and skips.
 
 #![cfg(target_os = "linux")]
@@ -75,6 +78,11 @@ pub const FIXTURE: &[u8] = include_bytes!("../fixtures/testcard.h264");
 /// pixels per frame so the frames differ and the stream carries real inter-frame (`P`) frames. It is
 /// small enough to carry in-tree and decoded the same way a real stream is.
 pub const CLIP: &[u8] = include_bytes!("../fixtures/clip.h264");
+
+/// The same one-frame card, encoded **limited** range (BT.601, tagged `MPEG`): the shape almost every
+/// real stream is in, and the one that proves the renderer honours the colour space the decoder reads
+/// off the stream rather than assuming full range.
+pub const FIXTURE_LIMITED: &[u8] = include_bytes!("../fixtures/testcard_limited.h264");
 
 /// Decode the first frame of `bitstream` on the GPU and export its surface for the renderer.
 ///
@@ -568,6 +576,32 @@ mod codec {
     /// `AV_NOPTS_VALUE`: the parser needs a timestamp, and the streams here carry none.
     const AV_NOPTS_VALUE: i64 = i64::MIN;
 
+    /// The colour space the decoder read from a frame's `colorspace`, `color_range` and `height`,
+    /// mapped onto the engine's declaration.
+    ///
+    /// A stream that names no matrix is resolved by height, by the usual convention: standard
+    /// definition is BT.601, high definition BT.709. A stream that names no range is taken as
+    /// limited — the studio range real streams are almost always in, and the range a full-range
+    /// buffer read as limited only loses contrast over, where the reverse clips.
+    fn color_space(colorspace: c_int, color_range: c_int, height: c_int) -> gpui_engine::YuvColorSpace {
+        use gpui_engine::{YuvColorSpace, YuvMatrix, YuvRange};
+
+        // `AVCOL_RANGE_JPEG` is the only range that means full; `MPEG` and `UNSPECIFIED` are limited.
+        let range = match color_range {
+            2 => YuvRange::Full,
+            _ => YuvRange::Limited,
+        };
+        let matrix = match colorspace {
+            1 => YuvMatrix::Bt709,       // AVCOL_SPC_BT709
+            5 | 6 => YuvMatrix::Bt601,   // AVCOL_SPC_BT470BG, AVCOL_SPC_SMPTE170M
+            9 | 10 => YuvMatrix::Bt2020, // AVCOL_SPC_BT2020_NCL, AVCOL_SPC_BT2020_CL
+            // Unspecified, or a matrix with no RGB equivalent: the resolution default.
+            _ if height <= 576 => YuvMatrix::Bt601,
+            _ => YuvMatrix::Bt709,
+        };
+        YuvColorSpace { matrix, range }
+    }
+
     #[repr(C)]
     struct AvBufferRef {
         _buffer: *mut c_void,
@@ -588,9 +622,21 @@ mod codec {
         _quirks: u32,
     }
 
+    /// `AVFrame`, of which only the fields the decode reads are named: the plane pointers, the picture
+    /// height (to pick a default matrix when the stream names none), and the colour range and matrix
+    /// the decoder read from the bitstream. The offsets are the ones `clang` reports for ffmpeg 8.0
+    /// and are asserted below.
     #[repr(C)]
     struct AvFrame {
         data: [*mut u8; 8],
+        _to_height: [u8; 104 - 64],
+        _width: c_int,
+        height: c_int,
+        _to_range: [u8; 280 - 112],
+        color_range: c_int,
+        _color_primaries: c_int,
+        _color_trc: c_int,
+        colorspace: c_int,
     }
 
     #[repr(C)]
@@ -614,6 +660,9 @@ mod codec {
     const _: () = {
         assert!(core::mem::offset_of!(AvCodecContext, hw_device_ctx) == 560);
         assert!(core::mem::offset_of!(AvFrame, data) == 0);
+        assert!(core::mem::offset_of!(AvFrame, height) == 108);
+        assert!(core::mem::offset_of!(AvFrame, color_range) == 280);
+        assert!(core::mem::offset_of!(AvFrame, colorspace) == 292);
         assert!(core::mem::offset_of!(AvPacket, data) == 24);
         assert!(core::mem::offset_of!(AvPacket, size) == 32);
         assert!(core::mem::offset_of!(AvBufferRef, data) == 8);
@@ -884,12 +933,16 @@ mod codec {
                 return None;
             }
             let surface = unsafe { (*frame).data[3] as usize as u32 };
+            let (colorspace, color_range, height) = unsafe {
+                ((*frame).colorspace, (*frame).color_range, (*frame).height)
+            };
+            let color_space = color_space(colorspace, color_range, height);
             match va::export(self.display, surface) {
                 Ok(handle) => Some(Frame {
                     _libs: self.libs.clone(),
                     symbols: self.symbols,
                     frame,
-                    handle,
+                    handle: handle.with_color_space(color_space),
                 }),
                 Err(error) => {
                     log::warn!("gpui_va: exporting a decoded surface: {error:#}");
@@ -947,6 +1000,34 @@ mod codec {
             return None;
         }
         decoder.receive()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::color_space;
+        use gpui_engine::{YuvColorSpace, YuvMatrix, YuvRange};
+
+        /// A stream that names its matrix and range is taken at its word.
+        #[test]
+        fn a_named_colour_space_is_kept() {
+            // `AVCOL_SPC_BT709`, `AVCOL_RANGE_JPEG`.
+            assert_eq!(
+                color_space(1, 2, 720),
+                YuvColorSpace {
+                    matrix: YuvMatrix::Bt709,
+                    range: YuvRange::Full,
+                },
+            );
+        }
+
+        /// A stream that names neither is resolved by convention: standard definition is BT.601, high
+        /// definition BT.709, and the range is taken as limited — the defaults real footage needs.
+        #[test]
+        fn an_unnamed_colour_space_is_resolved_by_height() {
+            // `AVCOL_SPC_UNSPECIFIED`, `AVCOL_RANGE_UNSPECIFIED`.
+            assert_eq!(color_space(2, 0, 576), YuvColorSpace::BT601_LIMITED);
+            assert_eq!(color_space(2, 0, 1080), YuvColorSpace::BT709_LIMITED);
+        }
     }
 }
 
@@ -1188,6 +1269,34 @@ mod tests {
             "a decoded surface is tiled"
         );
         assert_eq!(handle.plane_count(), 2);
+    }
+
+    /// The decoder reads the stream's colour space off the frame and declares it on the exported
+    /// handle: a full-range stream stays full, a limited-range one is declared limited. Without this
+    /// a real stream's limited bytes would be read as full range and play washed out.
+    #[test]
+    fn the_decoded_handle_carries_the_streams_colour_space() {
+        use gpui_engine::{YuvColorSpace, YuvMatrix, YuvRange};
+
+        let Some(full) = decode(FIXTURE) else {
+            eprintln!(
+                "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
+            );
+            return;
+        };
+        assert_eq!(
+            full.handle().color_space,
+            YuvColorSpace {
+                matrix: YuvMatrix::Bt601,
+                range: YuvRange::Full,
+            },
+        );
+
+        let Some(limited) = decode(FIXTURE_LIMITED) else {
+            eprintln!("skipping: the limited fixture did not decode");
+            return;
+        };
+        assert_eq!(limited.handle().color_space, YuvColorSpace::BT601_LIMITED);
     }
 
     /// A stream, decoded frame by frame: every frame exports its own tiled surface, and holding them
