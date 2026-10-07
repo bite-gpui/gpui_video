@@ -362,6 +362,136 @@ fn fill_tiled(handle: &DmaBufHandle, colour: [u8; 4]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The version gate for `libavcodec`/`libavutil`, and where their symbols will be resolved.
+///
+/// ffmpeg bumps a library's soname exactly when its ABI changes, so `libavcodec.so.62` *is* the ABI
+/// version — and the versioned `VkImage`-style declarations this crate will carry are written against
+/// it. Loading that soname, then resolving a symbol *by version tag* (`LIBAVCODEC_62`), refuses a
+/// library that is present but not the ABI declared for, rather than mis-reading its structs.
+mod ffmpeg {
+    use std::ffi::{CString, c_char, c_int, c_void};
+
+    /// The `(libavcodec, libavutil)` majors the decode declarations are written against.
+    ///
+    /// libavcodec 62 / libavutil 60 is ffmpeg 8.0.
+    const ABI: (u32, u32) = (62, 60);
+
+    const RTLD_NOW: c_int = 2;
+
+    unsafe extern "C" {
+        fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
+        fn dlclose(handle: *mut c_void) -> c_int;
+        fn dlvsym(
+            handle: *mut c_void,
+            symbol: *const c_char,
+            version: *const c_char,
+        ) -> *mut c_void;
+    }
+
+    /// A loaded, ABI-checked `libavcodec` and `libavutil`, held for as long as the decode uses them.
+    #[allow(dead_code, reason = "the decode wiring resolves symbols through it next")]
+    pub struct Ffmpeg {
+        codec: *mut c_void,
+        util: *mut c_void,
+    }
+
+    impl Drop for Ffmpeg {
+        fn drop(&mut self) {
+            unsafe {
+                dlclose(self.util);
+                dlclose(self.codec);
+            }
+        }
+    }
+
+    // The handles are process-global library mappings, which are safe to move and share; the decode
+    // calls them from one thread.
+    unsafe impl Send for Ffmpeg {}
+    unsafe impl Sync for Ffmpeg {}
+
+    /// Load the declared ABI, or `None` when `libavcodec`/`libavutil` of that ABI is not installed.
+    #[allow(dead_code, reason = "the decode wiring calls it next")]
+    pub fn load() -> Option<Ffmpeg> {
+        let (codec_major, util_major) = ABI;
+        let codec = format!("libavcodec.so.{codec_major}");
+        let util = format!("libavutil.so.{util_major}");
+        // One representative symbol per library, by version tag: this is the ABI assertion.
+        if !probe(&codec, "avcodec_find_decoder", &format!("LIBAVCODEC_{codec_major}"))
+            || !probe(
+                &util,
+                "av_hwdevice_ctx_create",
+                &format!("LIBAVUTIL_{util_major}"),
+            )
+        {
+            return None;
+        }
+        let codec = unsafe { dlopen(CString::new(codec).ok()?.as_ptr(), RTLD_NOW) };
+        if codec.is_null() {
+            return None;
+        }
+        let util = unsafe { dlopen(CString::new(util).ok()?.as_ptr(), RTLD_NOW) };
+        if util.is_null() {
+            unsafe { dlclose(codec) };
+            return None;
+        }
+        Some(Ffmpeg { codec, util })
+    }
+
+    /// Whether `soname` exports `symbol` under `version`'s ABI — the check [`load`] gates on.
+    pub(crate) fn probe(soname: &str, symbol: &str, version: &str) -> bool {
+        let Ok(soname) = CString::new(soname) else {
+            return false;
+        };
+        let Ok(symbol) = CString::new(symbol) else {
+            return false;
+        };
+        let Ok(version) = CString::new(version) else {
+            return false;
+        };
+        let handle = unsafe { dlopen(soname.as_ptr(), RTLD_NOW) };
+        if handle.is_null() {
+            return false;
+        }
+        let resolved = unsafe { dlvsym(handle, symbol.as_ptr(), version.as_ptr()) };
+        unsafe { dlclose(handle) };
+        !resolved.is_null()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::probe;
+
+        #[test]
+        fn the_gate_takes_the_declared_abi_and_refuses_another() {
+            assert!(probe(
+                "libavcodec.so.62",
+                "avcodec_find_decoder",
+                "LIBAVCODEC_62"
+            ));
+            assert!(!probe(
+                "libavcodec.so.62",
+                "avcodec_find_decoder",
+                "LIBAVCODEC_61"
+            ));
+            assert!(probe(
+                "libavutil.so.60",
+                "av_hwdevice_ctx_create",
+                "LIBAVUTIL_60"
+            ));
+            assert!(!probe(
+                "libavutil.so.60",
+                "av_hwdevice_ctx_create",
+                "LIBAVUTIL_59"
+            ));
+            assert!(!probe(
+                "libavcodec.so.99",
+                "avcodec_find_decoder",
+                "LIBAVCODEC_99"
+            ));
+        }
+    }
+}
+
 /// The VA-API FFI: create an NV12 surface with the driver, and export it as a dma-buf.
 mod va {
     #![allow(non_upper_case_globals)]
