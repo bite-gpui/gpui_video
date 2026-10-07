@@ -22,3 +22,5 @@ log.workspace = true
 libloading = "0.8"
 # The GPU copy that fills the surface, and the dma-buf export the driver does not do for us.
 ash = "0.38"
+# `eventfd`, and the `poll` a playback waits on a consumer's release with.
+libc.workspace = true

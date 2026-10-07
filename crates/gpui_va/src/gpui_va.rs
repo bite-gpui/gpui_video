@@ -24,6 +24,10 @@
 
 #![cfg(target_os = "linux")]
 
+use std::collections::VecDeque;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::Arc;
+
 use gpui_engine::DmaBufHandle;
 
 /// A VA-API surface, kept alive for as long as the renderer samples its dma-buf.
@@ -93,6 +97,193 @@ pub fn decode(bitstream: &[u8]) -> Option<Frame> {
 }
 
 pub use codec::{Decoder, Frame};
+
+/// A bounded playback over a stream: it decodes a few frames ahead, hands one out at a time, and
+/// recycles a surface only once the consumer says it has finished with it.
+///
+/// The bound is the point. A VA surface returns to the decoder's pool when its [`Frame`] is dropped,
+/// so a player that held every frame would pin every surface it ever decoded, and one that dropped
+/// frames too eagerly would let the GPU sample a surface the decoder had already overwritten. This
+/// keeps at most the `depth` given to [`open`](Self::open) frames alive, tags every handle it hands
+/// out with a release descriptor (see [`DmaBufHandle::release`](gpui_engine::DmaBufHandle::release)),
+/// and recycles a frame only after the consumer has signalled it — and never the frame that is still
+/// on screen, which a scene re-samples every frame it is held for.
+///
+/// The stream loops: when the decoder drains, a fresh one takes over.
+pub struct Playback {
+    stream: Vec<u8>,
+    decoder: Decoder,
+    /// How much of `stream` has been fed to the decoder, in bytes.
+    fed: usize,
+    /// Whether the decoder has been told the stream has ended for this pass.
+    ended: bool,
+    /// Decoded frames not yet handed out.
+    queued: VecDeque<Frame>,
+    /// Handed out and not yet recycled, oldest first.
+    live: VecDeque<Live>,
+    /// The handle last handed out, returned again while the consumer has not caught up.
+    current: Option<DmaBufHandle>,
+    /// The most frames that may be alive at once.
+    depth: usize,
+    /// How many frames have been handed out, across loops.
+    position: u64,
+}
+
+/// A frame handed to the consumer, held so its surface stays allocated until it is recycled.
+struct Live {
+    _frame: Frame,
+    release: Arc<OwnedFd>,
+}
+
+/// How much of the stream is fed to the decoder at a time. Small, so one feed decodes only a frame or
+/// two — the bound is on *frames*, and a big feed would decode past it.
+const FEED_CHUNK: usize = 512;
+
+/// The fewest frames a playback may keep alive: one on screen, one to hand out next.
+const MIN_DEPTH: usize = 2;
+
+impl Playback {
+    /// Open a playback over `stream`, keeping at most `depth` frames alive (at least two), or `None`
+    /// where the decoder is unavailable or `stream` yields no frame at all.
+    pub fn open(stream: &[u8], depth: usize) -> Option<Self> {
+        let mut playback = Self {
+            stream: stream.to_vec(),
+            decoder: Decoder::open()?,
+            fed: 0,
+            ended: false,
+            queued: VecDeque::new(),
+            live: VecDeque::new(),
+            current: None,
+            depth: depth.max(MIN_DEPTH),
+            position: 0,
+        };
+        playback.fill();
+        (!playback.queued.is_empty()).then_some(playback)
+    }
+
+    /// The next frame to show, or the one already showing while the consumer has not released it.
+    /// `None` only when the stream yields nothing at all.
+    pub fn next(&mut self) -> Option<DmaBufHandle> {
+        self.recycle();
+        if self.live.len() < self.depth {
+            if self.queued.is_empty() {
+                self.fill();
+            }
+            if let Some(frame) = self.queued.pop_front() {
+                let Some(release) = release_descriptor() else {
+                    return self.current.clone();
+                };
+                let release = Arc::new(release);
+                let mut handle = frame.handle().clone();
+                handle.release = Some(release.clone());
+                self.live.push_back(Live {
+                    _frame: frame,
+                    release,
+                });
+                self.current = Some(handle.clone());
+                self.position += 1;
+                return Some(handle);
+            }
+        }
+        self.current.clone()
+    }
+
+    /// How many frames are alive: the ones handed out and not yet recycled.
+    pub fn live(&self) -> usize {
+        self.live.len()
+    }
+
+    /// How many frames have been handed out, across loops.
+    pub fn position(&self) -> u64 {
+        self.position
+    }
+
+    /// Recycle every released frame except the one still on screen. Keeping the newest alive is what
+    /// makes re-showing it (when the consumer has not caught up) safe: the scene may re-sample it at
+    /// any time, so its surface must not go back to the pool.
+    fn recycle(&mut self) {
+        while self.live.len() > 1 {
+            let signalled = self
+                .live
+                .front()
+                .is_some_and(|live| release_signalled(&live.release));
+            if !signalled {
+                break;
+            }
+            self.live.pop_front();
+        }
+    }
+
+    /// Feed the stream a chunk at a time until a frame is ready, the stream is drained, or the budget
+    /// runs out. The budget bounds the work (and rules out a spin on a stream that decodes nothing).
+    fn fill(&mut self) {
+        let mut budget = 2 * (self.stream.len() / FEED_CHUNK + 2);
+        while self.queued.len() < self.depth && budget > 0 {
+            budget -= 1;
+            let before = self.queued.len();
+            if self.fed < self.stream.len() {
+                let end = (self.fed + FEED_CHUNK).min(self.stream.len());
+                if self.decoder.send(&self.stream[self.fed..end]).is_err() {
+                    return;
+                }
+                self.fed = end;
+            } else if !self.ended {
+                if self.decoder.finish().is_err() {
+                    return;
+                }
+                self.ended = true;
+            } else if self.queued.is_empty() {
+                self.restart();
+            } else {
+                return;
+            }
+            while self.queued.len() < self.depth {
+                match self.decoder.receive() {
+                    Some(frame) => self.queued.push_back(frame),
+                    None => break,
+                }
+            }
+            if self.queued.len() > before {
+                return;
+            }
+        }
+    }
+
+    /// Begin the stream again on a fresh decoder, so a drained stream loops.
+    fn restart(&mut self) {
+        if let Some(decoder) = Decoder::open() {
+            self.decoder = decoder;
+            self.fed = 0;
+            self.ended = false;
+        }
+    }
+}
+
+/// A fresh `eventfd` the consumer signals once it has finished with a surface. Non-blocking, so a
+/// signal can never stall the consumer, and `CLOEXEC`, so it does not leak into a child.
+fn release_descriptor() -> Option<OwnedFd> {
+    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+    if fd < 0 {
+        log::warn!(
+            "gpui_va: cannot create a release descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+        return None;
+    }
+    // SAFETY: `eventfd` returned a fresh descriptor this process owns.
+    Some(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Whether the consumer has signalled `release` — a non-blocking `poll`, the same wait the renderer
+/// does on an acquire fence.
+fn release_signalled(release: &OwnedFd) -> bool {
+    let mut descriptor = libc::pollfd {
+        fd: release.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    (unsafe { libc::poll(&mut descriptor, 1, 0) }) > 0
+}
 
 /// Fill a tiled `Nv12` dma-buf with `colour`, on the GPU.
 ///
@@ -1321,5 +1512,83 @@ mod tests {
         }
 
         assert_eq!(frames.len(), 60, "the clip is 60 frames");
+    }
+
+    /// Signal a handle's release descriptor, as the renderer does once it has finished with a frame.
+    fn signal(handle: &DmaBufHandle) {
+        let Some(release) = handle.release.as_ref() else {
+            panic!("a handed-out handle carries a release descriptor");
+        };
+        let counter: u64 = 1;
+        // SAFETY: the descriptor is an `eventfd` the playback made; the pointer and length describe
+        // one `u64`, as `eventfd` requires.
+        let written = unsafe {
+            libc::write(
+                release.as_raw_fd(),
+                std::ptr::addr_of!(counter).cast(),
+                std::mem::size_of::<u64>(),
+            )
+        };
+        assert_eq!(written as usize, std::mem::size_of::<u64>());
+    }
+
+    /// However long it plays, a playback keeps only a bounded number of frames alive and cycles the
+    /// stream — the point of the ring, where holding every frame would pin every surface.
+    #[test]
+    fn a_playback_keeps_a_bounded_number_of_frames_alive() {
+        let Some(mut playback) = Playback::open(CLIP, 3) else {
+            eprintln!(
+                "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
+            );
+            return;
+        };
+
+        let mut peak = 0;
+        for _ in 0..200 {
+            let Some(handle) = playback.next() else {
+                break;
+            };
+            peak = peak.max(playback.live());
+            // The consumer is done with the frame at once.
+            signal(&handle);
+        }
+
+        assert!(peak <= 3, "at most `depth` frames live, saw {peak}");
+        assert!(
+            playback.position() > 60,
+            "the playback looped past the clip's 60 frames, at {}",
+            playback.position()
+        );
+    }
+
+    /// Without a release the playback stops rather than recycle a surface a consumer may still be
+    /// sampling; once the outstanding frames are released it advances again.
+    #[test]
+    fn a_playback_waits_for_the_release_before_recycling() {
+        let Some(mut playback) = Playback::open(CLIP, 2) else {
+            eprintln!(
+                "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
+            );
+            return;
+        };
+
+        // Draw a few frames without releasing any: the ring fills and then stalls.
+        let mut drawn = Vec::new();
+        for _ in 0..4 {
+            drawn.push(playback.next().expect("a frame"));
+        }
+        assert_eq!(playback.live(), 2, "the bound holds");
+        assert_eq!(playback.position(), 2, "and it stops rather than recycle");
+
+        // Release everything the consumer was given, and the playback advances again.
+        for handle in &drawn {
+            signal(handle);
+        }
+        let _ = playback.next();
+        assert!(
+            playback.position() > 2,
+            "releasing lets it advance, at {}",
+            playback.position()
+        );
     }
 }
