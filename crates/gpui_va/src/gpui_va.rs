@@ -58,6 +58,24 @@ fn nv12_from_rgb(rgb: [u8; 4]) -> (u8, u8, u8) {
     )
 }
 
+/// The fixture the demo decodes: a 128×128 Main-profile H.264 keyframe carrying the same SMPTE bars
+/// the other tiles do, pinned so the demo and the tests decode one fixed bitstream.
+///
+/// It is encoded full-range, each bar's `Y`, `Cb` and `Cr` the inverse of the shader's matrix, so the
+/// decode and the shader round-trip to the bar colours; a limited-range or differently-matrized
+/// encode would instead arrive as washed-out bars.
+pub const FIXTURE: &[u8] = include_bytes!("../fixtures/testcard.h264");
+
+/// Decode `bitstream` on the GPU and export the decoded surface for the renderer.
+///
+/// `None` when libavcodec of the declared ABI is not installed, or the stream does not decode: the
+/// surface path then simply has nothing to composite.
+pub fn decode(bitstream: &[u8]) -> Option<(Decoded, DmaBufHandle)> {
+    codec::decode(bitstream)
+}
+
+pub use codec::Decoded;
+
 /// Fill a tiled `Nv12` dma-buf with `colour`, on the GPU.
 ///
 /// The buffer is imported into a Vulkan device the same way the renderer imports it, under the same
@@ -389,10 +407,30 @@ mod ffmpeg {
     }
 
     /// A loaded, ABI-checked `libavcodec` and `libavutil`, held for as long as the decode uses them.
-    #[allow(dead_code, reason = "the decode wiring resolves symbols through it next")]
     pub struct Ffmpeg {
         codec: *mut c_void,
         util: *mut c_void,
+    }
+
+    impl Ffmpeg {
+        /// A symbol from `libavcodec`, resolved under the declared ABI's version tag.
+        pub fn codec_symbol(&self, name: &str) -> Option<*mut c_void> {
+            resolve(self.codec, "LIBAVCODEC", ABI.0, name)
+        }
+
+        /// A symbol from `libavutil`, resolved under the declared ABI's version tag.
+        pub fn util_symbol(&self, name: &str) -> Option<*mut c_void> {
+            resolve(self.util, "LIBAVUTIL", ABI.1, name)
+        }
+    }
+
+    /// Resolve `name` in `handle` under `tag`'s ABI version — so a library that is not the declared
+    /// ABI yields nothing rather than a symbol whose layout we would read wrong.
+    fn resolve(handle: *mut c_void, tag: &str, major: u32, name: &str) -> Option<*mut c_void> {
+        let name = CString::new(name).ok()?;
+        let version = CString::new(format!("{tag}_{major}")).ok()?;
+        let symbol = unsafe { dlvsym(handle, name.as_ptr(), version.as_ptr()) };
+        (!symbol.is_null()).then_some(symbol)
     }
 
     impl Drop for Ffmpeg {
@@ -410,7 +448,6 @@ mod ffmpeg {
     unsafe impl Sync for Ffmpeg {}
 
     /// Load the declared ABI, or `None` when `libavcodec`/`libavutil` of that ABI is not installed.
-    #[allow(dead_code, reason = "the decode wiring calls it next")]
     pub fn load() -> Option<Ffmpeg> {
         let (codec_major, util_major) = ABI;
         let codec = format!("libavcodec.so.{codec_major}");
@@ -489,6 +526,249 @@ mod ffmpeg {
                 "LIBAVCODEC_99"
             ));
         }
+    }
+}
+
+/// The libavcodec decode: a bitstream in, a VA surface out, gated on the ABI the declarations target.
+///
+/// A decoder writes into a hardware surface the VA driver allocates, and `frame->data[3]` carries
+/// that surface's id; the surface is then exported by the same path the stand-in uses, so the tiled
+/// `Nv12` object reaches the renderer identically. Only `AVCodecContext::hw_device_ctx` is touched,
+/// and the offset asserts below are the layout `clang` reports for ffmpeg 8.0.
+mod codec {
+    #![allow(unsafe_op_in_unsafe_fn)]
+
+    use std::ffi::{c_char, c_int, c_void};
+    use std::ptr;
+
+    use gpui_engine::DmaBufHandle;
+
+    use super::ffmpeg::Ffmpeg;
+    use super::va;
+
+    const AV_HWDEVICE_TYPE_VAAPI: c_int = 3;
+
+    #[repr(C)]
+    struct AvBufferRef {
+        _buffer: *mut c_void,
+        data: *mut u8,
+        _size: usize,
+    }
+
+    #[repr(C)]
+    struct AvHwDeviceContext {
+        _class: *const c_void,
+        _type: c_int,
+        hwctx: *mut c_void,
+    }
+
+    #[repr(C)]
+    struct AvVaapiDeviceContext {
+        display: *mut c_void,
+        _quirks: u32,
+    }
+
+    #[repr(C)]
+    struct AvFrame {
+        data: [*mut u8; 8],
+    }
+
+    #[repr(C)]
+    struct AvPacket {
+        _buffer: *mut c_void,
+        _pts: i64,
+        _dts: i64,
+        data: *mut u8,
+        size: c_int,
+    }
+
+    /// `AVCodecContext`, of which only `hw_device_ctx` is reachable — 560 bytes in, past the fields we
+    /// do not name. That offset, and the other fields read, are the ones `clang` reports for ffmpeg
+    /// 8.0; the asserts below fail the build if a declaration drifts from them.
+    #[repr(C)]
+    struct AvCodecContext {
+        _prefix: [u64; 70],
+        hw_device_ctx: *mut AvBufferRef,
+    }
+
+    const _: () = {
+        assert!(core::mem::offset_of!(AvCodecContext, hw_device_ctx) == 560);
+        assert!(core::mem::offset_of!(AvFrame, data) == 0);
+        assert!(core::mem::offset_of!(AvPacket, data) == 24);
+        assert!(core::mem::offset_of!(AvPacket, size) == 32);
+        assert!(core::mem::offset_of!(AvBufferRef, data) == 8);
+        assert!(core::mem::offset_of!(AvHwDeviceContext, hwctx) == 16);
+        assert!(core::mem::offset_of!(AvVaapiDeviceContext, display) == 0);
+    };
+
+    type HwDeviceCtxCreate =
+        unsafe extern "C" fn(*mut *mut AvBufferRef, c_int, *const c_char, *mut c_void, c_int) -> c_int;
+    type FindDecoderByName = unsafe extern "C" fn(*const c_char) -> *const c_void;
+    type AllocContext3 = unsafe extern "C" fn(*const c_void) -> *mut AvCodecContext;
+    type Open2 = unsafe extern "C" fn(*mut AvCodecContext, *const c_void, *mut *mut c_void) -> c_int;
+    type SendPacket = unsafe extern "C" fn(*mut AvCodecContext, *const AvPacket) -> c_int;
+    type ReceiveFrame = unsafe extern "C" fn(*mut AvCodecContext, *mut AvFrame) -> c_int;
+    type FreeContext = unsafe extern "C" fn(*mut *mut AvCodecContext);
+    type PacketAlloc = unsafe extern "C" fn() -> *mut AvPacket;
+    type PacketFree = unsafe extern "C" fn(*mut *mut AvPacket);
+    type NewPacket = unsafe extern "C" fn(*mut AvPacket, c_int) -> c_int;
+    type FrameAlloc = unsafe extern "C" fn() -> *mut AvFrame;
+    type FrameFree = unsafe extern "C" fn(*mut *mut AvFrame);
+    type BufferRef = unsafe extern "C" fn(*mut AvBufferRef) -> *mut AvBufferRef;
+    type BufferUnref = unsafe extern "C" fn(*mut *mut AvBufferRef);
+
+    /// The libavcodec/libavutil functions the decode calls, each resolved under the ABI version tag.
+    #[derive(Clone, Copy)]
+    struct Symbols {
+        hwdevice_ctx_create: HwDeviceCtxCreate,
+        find_decoder_by_name: FindDecoderByName,
+        alloc_context3: AllocContext3,
+        open2: Open2,
+        send_packet: SendPacket,
+        receive_frame: ReceiveFrame,
+        free_context: FreeContext,
+        packet_alloc: PacketAlloc,
+        packet_free: PacketFree,
+        new_packet: NewPacket,
+        frame_alloc: FrameAlloc,
+        frame_free: FrameFree,
+        buffer_ref: BufferRef,
+        buffer_unref: BufferUnref,
+    }
+
+    impl Symbols {
+        fn resolve(libs: &Ffmpeg) -> Option<Self> {
+            fn symbol<T>(libs: &Ffmpeg, from_util: bool, name: &str) -> Option<T> {
+                let address = if from_util {
+                    libs.util_symbol(name)
+                } else {
+                    libs.codec_symbol(name)
+                }?;
+                // SAFETY: `T` is a function-pointer type, the same size as the address.
+                Some(unsafe { std::mem::transmute_copy(&address) })
+            }
+
+            Some(Self {
+                hwdevice_ctx_create: symbol(libs, true, "av_hwdevice_ctx_create")?,
+                find_decoder_by_name: symbol(libs, false, "avcodec_find_decoder_by_name")?,
+                alloc_context3: symbol(libs, false, "avcodec_alloc_context3")?,
+                open2: symbol(libs, false, "avcodec_open2")?,
+                send_packet: symbol(libs, false, "avcodec_send_packet")?,
+                receive_frame: symbol(libs, false, "avcodec_receive_frame")?,
+                free_context: symbol(libs, false, "avcodec_free_context")?,
+                packet_alloc: symbol(libs, false, "av_packet_alloc")?,
+                packet_free: symbol(libs, false, "av_packet_free")?,
+                new_packet: symbol(libs, false, "av_new_packet")?,
+                frame_alloc: symbol(libs, true, "av_frame_alloc")?,
+                frame_free: symbol(libs, true, "av_frame_free")?,
+                buffer_ref: symbol(libs, true, "av_buffer_ref")?,
+                buffer_unref: symbol(libs, true, "av_buffer_unref")?,
+            })
+        }
+    }
+
+    /// A decoded surface, and everything that must outlive the dma-buf exported from it.
+    pub struct Decoded {
+        _libs: Ffmpeg,
+        symbols: Symbols,
+        frame: *mut AvFrame,
+        packet: *mut AvPacket,
+        context: *mut AvCodecContext,
+        hw_device: *mut AvBufferRef,
+    }
+
+    impl Drop for Decoded {
+        fn drop(&mut self) {
+            // SAFETY: each pointer is one this decode allocated; each free accepts a null pointer, and
+            // the frame goes before the context so its surface is returned before the decoder dies.
+            unsafe {
+                (self.symbols.frame_free)(&mut self.frame);
+                (self.symbols.packet_free)(&mut self.packet);
+                (self.symbols.free_context)(&mut self.context);
+                (self.symbols.buffer_unref)(&mut self.hw_device);
+            }
+        }
+    }
+
+    /// Decode `bitstream` into a VA surface and export it.
+    pub fn decode(bitstream: &[u8]) -> Option<(Decoded, DmaBufHandle)> {
+        let libs = super::ffmpeg::load()?;
+        let symbols = Symbols::resolve(&libs)?;
+        match unsafe { run(libs, symbols, bitstream) } {
+            Ok(decoded) => Some(decoded),
+            Err(error) => {
+                log::warn!("gpui_va: decode failed: {error:#}");
+                None
+            }
+        }
+    }
+
+    unsafe fn run(
+        libs: Ffmpeg,
+        symbols: Symbols,
+        bitstream: &[u8],
+    ) -> anyhow::Result<(Decoded, DmaBufHandle)> {
+        let mut decoded = Decoded {
+            _libs: libs,
+            symbols,
+            frame: ptr::null_mut(),
+            packet: ptr::null_mut(),
+            context: ptr::null_mut(),
+            hw_device: ptr::null_mut(),
+        };
+        // From here any `?` drops `decoded`, freeing whatever has been built.
+        anyhow::ensure!(
+            (symbols.hwdevice_ctx_create)(
+                &mut decoded.hw_device,
+                AV_HWDEVICE_TYPE_VAAPI,
+                c"/dev/dri/renderD128".as_ptr(),
+                ptr::null_mut(),
+                0,
+            ) >= 0,
+            "av_hwdevice_ctx_create failed"
+        );
+        anyhow::ensure!(!decoded.hw_device.is_null(), "no hardware device");
+
+        // ffmpeg owns the VA display, and the export needs the same one.
+        let device_context = (*decoded.hw_device).data as *mut AvHwDeviceContext;
+        anyhow::ensure!(!device_context.is_null(), "the device has no context");
+        let vaapi = (*device_context).hwctx as *mut AvVaapiDeviceContext;
+        anyhow::ensure!(!vaapi.is_null(), "the device has no VA-API context");
+        let display = (*vaapi).display;
+        anyhow::ensure!(!display.is_null(), "the VA-API device has no display");
+
+        let codec = (symbols.find_decoder_by_name)(c"h264".as_ptr());
+        anyhow::ensure!(!codec.is_null(), "no h264 decoder");
+        decoded.context = (symbols.alloc_context3)(codec);
+        anyhow::ensure!(!decoded.context.is_null(), "avcodec_alloc_context3 failed");
+        (*decoded.context).hw_device_ctx = (symbols.buffer_ref)(decoded.hw_device);
+        anyhow::ensure!(
+            (symbols.open2)(decoded.context, codec, ptr::null_mut()) >= 0,
+            "avcodec_open2 failed"
+        );
+
+        decoded.packet = (symbols.packet_alloc)();
+        anyhow::ensure!(!decoded.packet.is_null(), "av_packet_alloc failed");
+        anyhow::ensure!(
+            (symbols.new_packet)(decoded.packet, bitstream.len() as c_int) >= 0,
+            "av_new_packet failed"
+        );
+        ptr::copy_nonoverlapping(bitstream.as_ptr(), (*decoded.packet).data, bitstream.len());
+        anyhow::ensure!(
+            (symbols.send_packet)(decoded.context, decoded.packet) >= 0,
+            "avcodec_send_packet failed"
+        );
+
+        decoded.frame = (symbols.frame_alloc)();
+        anyhow::ensure!(!decoded.frame.is_null(), "av_frame_alloc failed");
+        anyhow::ensure!(
+            (symbols.receive_frame)(decoded.context, decoded.frame) >= 0,
+            "the stream did not decode"
+        );
+        let surface = (*decoded.frame).data[3] as usize as u32;
+
+        let handle = va::export(display, surface)?;
+        Ok((decoded, handle))
     }
 }
 
@@ -612,7 +892,6 @@ mod va {
         let terminate: Terminate = unsafe { *va.get(b"vaTerminate\0")? };
         let create_surfaces: CreateSurfaces = unsafe { *va.get(b"vaCreateSurfaces\0")? };
         let destroy_surfaces: DestroySurfaces = unsafe { *va.get(b"vaDestroySurfaces\0")? };
-        let export: ExportSurfaceHandle = unsafe { *va.get(b"vaExportSurfaceHandle\0")? };
 
         // The Intel render node, the one the window renderer is steered to as well.
         let node = std::fs::File::open("/dev/dri/renderD128")?;
@@ -660,15 +939,28 @@ mod va {
             surface,
         };
 
+        let handle = export(display, surface)?;
+        Ok((producer, handle))
+    }
+
+    /// Export `surface`, on `display`, as the dma-buf the renderer consumes.
+    ///
+    /// The display may be one this module made ([`produce`]) or ffmpeg's (see the crate's decode):
+    /// both are the same libva, so the symbol is resolved fresh and the display used as given.
+    pub(super) fn export(display: *mut c_void, surface: u32) -> anyhow::Result<DmaBufHandle> {
+        let va = unsafe { Library::new("libva.so.2") }?;
+        let export: ExportSurfaceHandle = unsafe { *va.get(b"vaExportSurfaceHandle\0")? };
         let mut descriptor = RmDescriptor::default();
         anyhow::ensure!(
-            export(
-                display,
-                surface,
-                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
-                VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
-                &mut descriptor,
-            ) == 0,
+            unsafe {
+                export(
+                    display,
+                    surface,
+                    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
+                    VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS,
+                    &mut descriptor,
+                )
+            } == 0,
             "vaExportSurfaceHandle failed"
         );
         anyhow::ensure!(
@@ -677,13 +969,12 @@ mod va {
             descriptor.num_objects,
             descriptor.num_layers
         );
-
         let object = descriptor.objects[0];
         let luma = descriptor.layers[0];
         let chroma = descriptor.layers[1];
         let fd = unsafe { OwnedFd::from_raw_fd(object.fd) };
         let chroma_fd = fd.try_clone()?;
-        let handle = DmaBufHandle::new(
+        Ok(DmaBufHandle::new(
             descriptor.width,
             descriptor.height,
             DmaBufFormat::Nv12,
@@ -693,7 +984,30 @@ mod va {
                 DmaBufPlane::new(chroma_fd, u64::from(chroma.offset[0]), chroma.pitch[0]),
             ],
             None,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The decode path, against the checked-in fixture: a real H.264 keyframe decoded by the driver
+    /// into a tiled NV12 surface, which is what the renderer composites.
+    #[test]
+    fn the_fixture_decodes_to_a_tiled_surface() {
+        let Some((_decoded, handle)) = decode(FIXTURE) else {
+            eprintln!(
+                "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
+            );
+            return;
+        };
+        assert_eq!((handle.width, handle.height), (128, 128));
+        assert_ne!(
+            handle.modifier,
+            DmaBufHandle::LINEAR,
+            "a decoded surface is tiled"
         );
-        Ok((producer, handle))
+        assert_eq!(handle.plane_count(), 2);
     }
 }
