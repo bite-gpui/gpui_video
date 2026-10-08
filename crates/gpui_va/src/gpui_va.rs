@@ -26,7 +26,9 @@
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_engine::DmaBufHandle;
 
@@ -88,6 +90,12 @@ pub const CLIP: &[u8] = include_bytes!("../fixtures/clip.h264");
 /// off the stream rather than assuming full range.
 pub const FIXTURE_LIMITED: &[u8] = include_bytes!("../fixtures/testcard_limited.h264");
 
+/// A plain-baseline H.264 stream: the bars encoded Baseline with no constraint flag set — the shape an
+/// encoder that omits `constraint_set1_flag` leaves, and the one ffmpeg's VA-API hwaccel has no exact
+/// profile mapping for. Decoding it proves the decoder opts into a profile mismatch, so the driver
+/// takes a stream it would otherwise refuse and decode in software.
+pub const BASELINE: &[u8] = include_bytes!("../fixtures/baseline.h264");
+
 /// Decode the first frame of `bitstream` on the GPU and export its surface for the renderer.
 ///
 /// `None` when libavcodec of the declared ABI is not installed, or the stream does not decode: the
@@ -96,7 +104,7 @@ pub fn decode(bitstream: &[u8]) -> Option<Frame> {
     codec::decode(bitstream)
 }
 
-pub use codec::{Decoder, Frame};
+pub use codec::{Decoder, Demuxer, Frame};
 
 /// A bounded playback over a stream: it decodes a few frames ahead, hands one out at a time, and
 /// recycles a surface only once the consumer says it has finished with it.
@@ -109,14 +117,13 @@ pub use codec::{Decoder, Frame};
 /// and recycles a frame only after the consumer has signalled it — and never the frame that is still
 /// on screen, which a scene re-samples every frame it is held for.
 ///
-/// The stream loops: when the decoder drains, a fresh one takes over.
+/// A playback reads either an elementary stream in memory ([`open`](Self::open)) or a file — a raw
+/// stream or a container such as MP4 or Matroska — through libavformat
+/// ([`open_path`](Self::open_path)). Either way it loops: when the source drains, a fresh decoder
+/// takes over.
 pub struct Playback {
-    stream: Vec<u8>,
+    source: Source,
     decoder: Decoder,
-    /// How much of `stream` has been fed to the decoder, in bytes.
-    fed: usize,
-    /// Whether the decoder has been told the stream has ended for this pass.
-    ended: bool,
     /// Decoded frames not yet handed out.
     queued: VecDeque<Frame>,
     /// Handed out and not yet recycled, oldest first.
@@ -127,6 +134,26 @@ pub struct Playback {
     depth: usize,
     /// How many frames have been handed out, across loops.
     position: u64,
+}
+
+/// Where a playback's packets come from.
+enum Source {
+    /// An elementary stream in memory, fed a chunk at a time; the decoder's own parser frames it.
+    Stream {
+        bytes: Vec<u8>,
+        /// How much of `bytes` has been fed to the decoder.
+        fed: usize,
+        /// Whether the decoder has been told the stream has ended for this pass.
+        ended: bool,
+    },
+    /// A file read through libavformat, which frames its packets itself.
+    Container {
+        demuxer: Demuxer,
+        /// The file's path, so the stream can be re-opened when it loops.
+        path: PathBuf,
+        /// Whether the decoder has been flushed for this pass.
+        ended: bool,
+    },
 }
 
 /// A frame handed to the consumer, held so its surface stays allocated until it is recycled.
@@ -142,27 +169,83 @@ const FEED_CHUNK: usize = 512;
 /// The fewest frames a playback may keep alive: one on screen, one to hand out next.
 const MIN_DEPTH: usize = 2;
 
+/// What one feed step did.
+enum Fed {
+    /// The decoder was handed something.
+    Worked,
+    /// The source had nothing to give right now; stop until asked again.
+    Stalled,
+    /// The source is exhausted; start it over so the playback loops.
+    Drained,
+}
+
 impl Playback {
-    /// Open a playback over `stream`, keeping at most `depth` frames alive (at least two), or `None`
-    /// where the decoder is unavailable or `stream` yields no frame at all.
+    /// Open a playback over an elementary stream in memory, keeping at most `depth` frames alive (at
+    /// least two), or `None` where the decoder is unavailable or `stream` yields no frame at all.
     pub fn open(stream: &[u8], depth: usize) -> Option<Self> {
-        let mut playback = Self {
-            stream: stream.to_vec(),
-            decoder: Decoder::open()?,
-            fed: 0,
-            ended: false,
+        let decoder = Decoder::open()?;
+        let mut playback = Self::new(
+            Source::Stream {
+                bytes: stream.to_vec(),
+                fed: 0,
+                ended: false,
+            },
+            decoder,
+            depth,
+        );
+        playback.fill();
+        (!playback.queued.is_empty()).then_some(playback)
+    }
+
+    /// Open a playback over the file at `path`, decoded through libavformat — a raw elementary stream
+    /// or a container — or `None` where libavformat is unavailable, the file cannot be opened, or it
+    /// yields no frame at all.
+    pub fn open_path(path: &Path, depth: usize) -> Option<Self> {
+        let demuxer = Demuxer::open(path)?;
+        let decoder = demuxer.decoder()?;
+        let mut playback = Self::new(
+            Source::Container {
+                demuxer,
+                path: path.to_owned(),
+                ended: false,
+            },
+            decoder,
+            depth,
+        );
+        playback.fill();
+        (!playback.queued.is_empty()).then_some(playback)
+    }
+
+    fn new(source: Source, decoder: Decoder, depth: usize) -> Self {
+        Self {
+            source,
+            decoder,
             queued: VecDeque::new(),
             live: VecDeque::new(),
             current: None,
             depth: depth.max(MIN_DEPTH),
             position: 0,
-        };
-        playback.fill();
-        (!playback.queued.is_empty()).then_some(playback)
+        }
+    }
+
+    /// The frame period the source declares, where it declares one, so a player can pace playback at
+    /// the stream's own rate. A raw in-memory stream carries no rate; a file is taken at the rate
+    /// libavformat reads.
+    pub fn frame_period(&self) -> Option<Duration> {
+        match &self.source {
+            Source::Stream { .. } => None,
+            Source::Container { demuxer, .. } => demuxer.frame_period(),
+        }
     }
 
     /// The next frame to show, or the one already showing while the consumer has not released it.
     /// `None` only when the stream yields nothing at all.
+    ///
+    /// Every handle this hands out is expected to be composited: the renderer signals the handle's
+    /// release descriptor once it has sampled the buffer, and only then does the playback return the
+    /// surface to the decoder's pool. A consumer that takes a frame and never shows it must signal
+    /// that handle's [`release`](gpui_engine::DmaBufHandle::release) itself — a frame nothing ever
+    /// samples is a frame nothing ever releases, and the ring waits on it for good.
     pub fn next(&mut self) -> Option<DmaBufHandle> {
         self.recycle();
         if self.live.len() < self.depth {
@@ -193,6 +276,15 @@ impl Playback {
         self.live.len()
     }
 
+    /// How many of the live frames the renderer has released — the ones [`live`](Self::live) will
+    /// recycle. The rest are still being sampled, or were never composited.
+    pub fn signalled(&self) -> usize {
+        self.live
+            .iter()
+            .filter(|live| release_signalled(&live.release))
+            .count()
+    }
+
     /// How many frames have been handed out, across loops.
     pub fn position(&self) -> u64 {
         self.position
@@ -214,28 +306,20 @@ impl Playback {
         }
     }
 
-    /// Feed the stream a chunk at a time until a frame is ready, the stream is drained, or the budget
-    /// runs out. The budget bounds the work (and rules out a spin on a stream that decodes nothing).
+    /// Feed the source until a frame is ready, it drains, or the budget runs out. The budget bounds
+    /// the work (and rules out a spin on a source that decodes nothing).
     fn fill(&mut self) {
-        let mut budget = 2 * (self.stream.len() / FEED_CHUNK + 2);
+        let mut budget = match &self.source {
+            Source::Stream { bytes, .. } => 2 * (bytes.len() / FEED_CHUNK + 2),
+            Source::Container { .. } => 2 * (self.depth + 8),
+        };
         while self.queued.len() < self.depth && budget > 0 {
             budget -= 1;
             let before = self.queued.len();
-            if self.fed < self.stream.len() {
-                let end = (self.fed + FEED_CHUNK).min(self.stream.len());
-                if self.decoder.send(&self.stream[self.fed..end]).is_err() {
-                    return;
-                }
-                self.fed = end;
-            } else if !self.ended {
-                if self.decoder.finish().is_err() {
-                    return;
-                }
-                self.ended = true;
-            } else if self.queued.is_empty() {
-                self.restart();
-            } else {
-                return;
+            match self.feed() {
+                Fed::Worked => {}
+                Fed::Stalled => return,
+                Fed::Drained => self.restart(),
             }
             while self.queued.len() < self.depth {
                 match self.decoder.receive() {
@@ -249,12 +333,65 @@ impl Playback {
         }
     }
 
-    /// Begin the stream again on a fresh decoder, so a drained stream loops.
+    /// One step of pulling from the source: hand the decoder the next unit, end the source, or report
+    /// that it has drained and must start over.
+    fn feed(&mut self) -> Fed {
+        match &mut self.source {
+            Source::Stream { bytes, fed, ended } => {
+                if *fed < bytes.len() {
+                    let end = (*fed + FEED_CHUNK).min(bytes.len());
+                    if self.decoder.send(&bytes[*fed..end]).is_err() {
+                        return Fed::Stalled;
+                    }
+                    *fed = end;
+                    Fed::Worked
+                } else if !*ended {
+                    if self.decoder.finish().is_err() {
+                        return Fed::Stalled;
+                    }
+                    *ended = true;
+                    Fed::Worked
+                } else if self.queued.is_empty() {
+                    Fed::Drained
+                } else {
+                    Fed::Stalled
+                }
+            }
+            Source::Container { demuxer, ended, .. } => match demuxer.send_next(&mut self.decoder) {
+                Ok(true) => Fed::Worked,
+                Ok(false) if !*ended => {
+                    if self.decoder.finish().is_err() {
+                        return Fed::Stalled;
+                    }
+                    *ended = true;
+                    Fed::Worked
+                }
+                Ok(false) if self.queued.is_empty() => Fed::Drained,
+                Ok(false) => Fed::Stalled,
+                Err(_) => Fed::Stalled,
+            },
+        }
+    }
+
+    /// Begin the source again, so a drained playback loops.
     fn restart(&mut self) {
-        if let Some(decoder) = Decoder::open() {
-            self.decoder = decoder;
-            self.fed = 0;
-            self.ended = false;
+        match &mut self.source {
+            Source::Stream { fed, ended, .. } => {
+                if let Some(decoder) = Decoder::open() {
+                    self.decoder = decoder;
+                    *fed = 0;
+                    *ended = false;
+                }
+            }
+            Source::Container { demuxer, path, ended } => {
+                if let Some(fresh) = Demuxer::open(path.as_path())
+                    && let Some(decoder) = fresh.decoder()
+                {
+                    self.decoder = decoder;
+                    *demuxer = fresh;
+                    *ended = false;
+                }
+            }
         }
     }
 }
@@ -589,19 +726,24 @@ fn fill_tiled(handle: &DmaBufHandle, colour: [u8; 4]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The version gate for `libavcodec`/`libavutil`, and where their symbols will be resolved.
+/// The version gate for `libavcodec`/`libavutil`/`libavformat`, and where their symbols are
+/// resolved.
 ///
 /// ffmpeg bumps a library's soname exactly when its ABI changes, so `libavcodec.so.62` *is* the ABI
-/// version — and the versioned `VkImage`-style declarations this crate will carry are written against
-/// it. Loading that soname, then resolving a symbol *by version tag* (`LIBAVCODEC_62`), refuses a
-/// library that is present but not the ABI declared for, rather than mis-reading its structs.
+/// version — and the versioned declarations this crate carries are written against it. Loading that
+/// soname, then resolving a symbol *by version tag* (`LIBAVCODEC_62`), refuses a library that is
+/// present but not the ABI declared for, rather than mis-reading its structs.
+///
+/// `libavformat` is held to the same gate but is optional: it is what opens a container, while the
+/// elementary-stream decode stands without it, so a machine that has only `libavcodec` still plays a
+/// raw stream.
 mod ffmpeg {
     use std::ffi::{CString, c_char, c_int, c_void};
 
-    /// The `(libavcodec, libavutil)` majors the decode declarations are written against.
+    /// The `(libavcodec, libavutil, libavformat)` majors the declarations are written against.
     ///
-    /// libavcodec 62 / libavutil 60 is ffmpeg 8.0.
-    const ABI: (u32, u32) = (62, 60);
+    /// libavcodec 62 / libavutil 60 / libavformat 62 is ffmpeg 8.0.
+    const ABI: (u32, u32, u32) = (62, 60, 62);
 
     const RTLD_NOW: c_int = 2;
 
@@ -615,10 +757,14 @@ mod ffmpeg {
         ) -> *mut c_void;
     }
 
-    /// A loaded, ABI-checked `libavcodec` and `libavutil`, held for as long as the decode uses them.
+    /// A loaded, ABI-checked `libavcodec` and `libavutil`, held for as long as the decode uses them,
+    /// and `libavformat` where it is installed.
     pub struct Ffmpeg {
         codec: *mut c_void,
         util: *mut c_void,
+        /// Null where `libavformat` of the declared ABI is not installed, which turns containers off
+        /// while leaving the elementary-stream decode working.
+        format: *mut c_void,
     }
 
     impl Ffmpeg {
@@ -630,6 +776,14 @@ mod ffmpeg {
         /// A symbol from `libavutil`, resolved under the declared ABI's version tag.
         pub fn util_symbol(&self, name: &str) -> Option<*mut c_void> {
             resolve(self.util, "LIBAVUTIL", ABI.1, name)
+        }
+
+        /// A symbol from `libavformat`, or `None` where it is not installed.
+        pub fn format_symbol(&self, name: &str) -> Option<*mut c_void> {
+            if self.format.is_null() {
+                return None;
+            }
+            resolve(self.format, "LIBAVFORMAT", ABI.2, name)
         }
     }
 
@@ -645,6 +799,9 @@ mod ffmpeg {
     impl Drop for Ffmpeg {
         fn drop(&mut self) {
             unsafe {
+                if !self.format.is_null() {
+                    dlclose(self.format);
+                }
                 dlclose(self.util);
                 dlclose(self.codec);
             }
@@ -657,8 +814,9 @@ mod ffmpeg {
     unsafe impl Sync for Ffmpeg {}
 
     /// Load the declared ABI, or `None` when `libavcodec`/`libavutil` of that ABI is not installed.
+    /// `libavformat` is loaded too where it is, and silently left out where it is not.
     pub fn load() -> Option<Ffmpeg> {
-        let (codec_major, util_major) = ABI;
+        let (codec_major, util_major, format_major) = ABI;
         let codec = format!("libavcodec.so.{codec_major}");
         let util = format!("libavutil.so.{util_major}");
         // One representative symbol per library, by version tag: this is the ABI assertion.
@@ -680,7 +838,21 @@ mod ffmpeg {
             unsafe { dlclose(codec) };
             return None;
         }
-        Some(Ffmpeg { codec, util })
+        let format = format!("libavformat.so.{format_major}");
+        let format = if probe(
+            &format,
+            "avformat_open_input",
+            &format!("LIBAVFORMAT_{format_major}"),
+        ) {
+            unsafe { dlopen(CString::new(format).ok()?.as_ptr(), RTLD_NOW) }
+        } else {
+            std::ptr::null_mut()
+        };
+        Some(Ffmpeg {
+            codec,
+            util,
+            format,
+        })
     }
 
     /// Whether `soname` exports `symbol` under `version`'s ABI — the check [`load`] gates on.
@@ -735,6 +907,21 @@ mod ffmpeg {
                 "LIBAVCODEC_99"
             ));
         }
+
+        /// `libavformat` is held to the same version gate, under its own tag.
+        #[test]
+        fn the_gate_takes_libavformat_by_its_own_tag() {
+            assert!(probe(
+                "libavformat.so.62",
+                "avformat_open_input",
+                "LIBAVFORMAT_62"
+            ));
+            assert!(!probe(
+                "libavformat.so.62",
+                "avformat_open_input",
+                "LIBAVFORMAT_61"
+            ));
+        }
     }
 }
 
@@ -753,8 +940,10 @@ mod codec {
 
     use std::collections::VecDeque;
     use std::ffi::{c_char, c_int, c_void};
+    use std::path::Path;
     use std::ptr;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use gpui_engine::DmaBufHandle;
 
@@ -764,6 +953,14 @@ mod codec {
     const AV_HWDEVICE_TYPE_VAAPI: c_int = 3;
     /// `AV_CODEC_ID_H264`, a stable enum value in libavcodec.
     const AV_CODEC_ID_H264: c_int = 27;
+    /// `AV_PIX_FMT_VAAPI`: the pixel format a hardware-decoded frame carries — as against the
+    /// software format the driver silently falls back to when it will not take a stream.
+    const AV_PIX_FMT_VAAPI: c_int = 44;
+    /// `AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH`: the opt-in that lets a hwaccel use the closest
+    /// profile it supports when a stream names one it has no mapping for.
+    const AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH: c_int = 1 << 2;
+    /// `AVMEDIA_TYPE_VIDEO`, a stable enum value in libavcodec.
+    const AVMEDIA_TYPE_VIDEO: c_int = 0;
     /// `AV_NOPTS_VALUE`: the parser needs a timestamp, and the streams here carry none.
     const AV_NOPTS_VALUE: i64 = i64::MIN;
 
@@ -814,16 +1011,19 @@ mod codec {
     }
 
     /// `AVFrame`, of which only the fields the decode reads are named: the plane pointers, the picture
-    /// height (to pick a default matrix when the stream names none), and the colour range and matrix
-    /// the decoder read from the bitstream. The offsets are the ones `clang` reports for ffmpeg 8.0
-    /// and are asserted below.
+    /// height (to pick a default matrix when the stream names none), the pixel format (to tell a
+    /// hardware frame from one the driver decoded in software), and the colour range and matrix the
+    /// decoder read from the bitstream. The offsets are the ones `clang` reports for ffmpeg 8.0 and
+    /// are asserted below.
     #[repr(C)]
     struct AvFrame {
         data: [*mut u8; 8],
         _to_height: [u8; 104 - 64],
         _width: c_int,
         height: c_int,
-        _to_range: [u8; 280 - 112],
+        _nb_samples: c_int,
+        format: c_int,
+        _to_range: [u8; 280 - 120],
         color_range: c_int,
         _color_primaries: c_int,
         _color_trc: c_int,
@@ -839,19 +1039,50 @@ mod codec {
         size: c_int,
     }
 
-    /// `AVCodecContext`, of which only `hw_device_ctx` is reachable — 560 bytes in, past the fields we
-    /// do not name. That offset, and the other fields read, are the ones `clang` reports for ffmpeg
-    /// 8.0; the asserts below fail the build if a declaration drifts from them.
+    /// `AVCodecContext`, of which `hw_device_ctx` and `hwaccel_flags` are reachable — 560 bytes in,
+    /// past the fields we do not name. Those offsets, and the other fields read, are the ones `clang`
+    /// reports for ffmpeg 8.0; the asserts below fail the build if a declaration drifts from them.
     #[repr(C)]
     struct AvCodecContext {
         _prefix: [u64; 70],
         hw_device_ctx: *mut AvBufferRef,
+        hwaccel_flags: c_int,
+    }
+
+    /// An `int`/`int` rational, as libavutil spells one (`num`/`den`).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct AvRational {
+        num: c_int,
+        den: c_int,
+    }
+
+    /// `AVFormatContext`, of which only the stream table is reachable: the count, and the streams
+    /// themselves, which [`Demuxer`] indexes to reach the video stream's parameters. The offsets are
+    /// the ones `clang` reports for ffmpeg 8.0 and are asserted below.
+    #[repr(C)]
+    struct AvFormatContext {
+        _to_nb_streams: [u8; 44],
+        nb_streams: u32,
+        streams: *mut *mut AvStream,
+    }
+
+    /// `AVStream`, of which `codecpar` — the parameters the decoder context is opened from — and the
+    /// average frame rate, which paces playback, are named. Both offsets are asserted below.
+    #[repr(C)]
+    struct AvStream {
+        _to_codecpar: [u8; 16],
+        codecpar: *mut c_void,
+        _to_avg_frame_rate: [u8; 88 - 24],
+        avg_frame_rate: AvRational,
     }
 
     const _: () = {
         assert!(core::mem::offset_of!(AvCodecContext, hw_device_ctx) == 560);
+        assert!(core::mem::offset_of!(AvCodecContext, hwaccel_flags) == 568);
         assert!(core::mem::offset_of!(AvFrame, data) == 0);
         assert!(core::mem::offset_of!(AvFrame, height) == 108);
+        assert!(core::mem::offset_of!(AvFrame, format) == 116);
         assert!(core::mem::offset_of!(AvFrame, color_range) == 280);
         assert!(core::mem::offset_of!(AvFrame, colorspace) == 292);
         assert!(core::mem::offset_of!(AvPacket, data) == 24);
@@ -859,6 +1090,10 @@ mod codec {
         assert!(core::mem::offset_of!(AvBufferRef, data) == 8);
         assert!(core::mem::offset_of!(AvHwDeviceContext, hwctx) == 16);
         assert!(core::mem::offset_of!(AvVaapiDeviceContext, display) == 0);
+        assert!(core::mem::offset_of!(AvFormatContext, nb_streams) == 44);
+        assert!(core::mem::offset_of!(AvFormatContext, streams) == 48);
+        assert!(core::mem::offset_of!(AvStream, codecpar) == 16);
+        assert!(core::mem::offset_of!(AvStream, avg_frame_rate) == 88);
     };
 
     type HwDeviceCtxCreate =
@@ -889,6 +1124,27 @@ mod codec {
         i64,
     ) -> c_int;
     type ParserClose = unsafe extern "C" fn(*mut c_void);
+    type ParametersToContext = unsafe extern "C" fn(*mut AvCodecContext, *const c_void) -> c_int;
+    type PacketUnref = unsafe extern "C" fn(*mut AvPacket);
+
+    /// The libavformat functions that open a file, find its video stream and read its packets.
+    type OpenInput = unsafe extern "C" fn(
+        *mut *mut AvFormatContext,
+        *const c_char,
+        *const c_void,
+        *mut *mut c_void,
+    ) -> c_int;
+    type FindStreamInfo = unsafe extern "C" fn(*mut AvFormatContext, *mut *mut c_void) -> c_int;
+    type FindBestStream = unsafe extern "C" fn(
+        *mut AvFormatContext,
+        c_int,
+        c_int,
+        c_int,
+        *mut *const c_void,
+        c_int,
+    ) -> c_int;
+    type ReadFrame = unsafe extern "C" fn(*mut AvFormatContext, *mut AvPacket) -> c_int;
+    type CloseInput = unsafe extern "C" fn(*mut *mut AvFormatContext);
 
     /// The libavcodec/libavutil functions the decode calls, each resolved under the ABI version tag.
     #[derive(Clone, Copy)]
@@ -910,6 +1166,7 @@ mod codec {
         parser_init: ParserInit,
         parser_parse2: ParserParse2,
         parser_close: ParserClose,
+        parameters_to_context: ParametersToContext,
     }
 
     impl Symbols {
@@ -942,6 +1199,42 @@ mod codec {
                 parser_init: symbol(libs, false, "av_parser_init")?,
                 parser_parse2: symbol(libs, false, "av_parser_parse2")?,
                 parser_close: symbol(libs, false, "av_parser_close")?,
+                parameters_to_context: symbol(libs, false, "avcodec_parameters_to_context")?,
+            })
+        }
+    }
+
+    /// The libavformat and libavcodec functions the demuxer calls, resolved only where `libavformat`
+    /// of the declared ABI is installed — so a machine without it decodes elementary streams and
+    /// simply cannot open a container.
+    struct FormatSymbols {
+        open_input: OpenInput,
+        find_stream_info: FindStreamInfo,
+        find_best_stream: FindBestStream,
+        read_frame: ReadFrame,
+        close_input: CloseInput,
+        packet_alloc: PacketAlloc,
+        packet_free: PacketFree,
+        packet_unref: PacketUnref,
+    }
+
+    impl FormatSymbols {
+        fn resolve(libs: &Ffmpeg) -> Option<Self> {
+            fn symbol<T>(address: Option<*mut c_void>) -> Option<T> {
+                let address = address?;
+                // SAFETY: `T` is a function-pointer type, the same size as the address.
+                Some(unsafe { std::mem::transmute_copy(&address) })
+            }
+
+            Some(Self {
+                open_input: symbol(libs.format_symbol("avformat_open_input"))?,
+                find_stream_info: symbol(libs.format_symbol("avformat_find_stream_info"))?,
+                find_best_stream: symbol(libs.format_symbol("av_find_best_stream"))?,
+                read_frame: symbol(libs.format_symbol("av_read_frame"))?,
+                close_input: symbol(libs.format_symbol("avformat_close_input"))?,
+                packet_alloc: symbol(libs.codec_symbol("av_packet_alloc"))?,
+                packet_free: symbol(libs.codec_symbol("av_packet_free"))?,
+                packet_unref: symbol(libs.codec_symbol("av_packet_unref"))?,
             })
         }
     }
@@ -961,15 +1254,29 @@ mod codec {
         /// Frames pulled from the decoder and not yet handed out. Draining after each access unit is
         /// what keeps `avcodec_send_packet` from returning `EAGAIN`.
         queue: VecDeque<Frame>,
+        /// Set once a frame arrives in a software pixel format, so the refusal is reported a single
+        /// time rather than once per frame.
+        not_hardware: bool,
     }
 
     impl Decoder {
         /// Open a decoder over the VA-API device, or `None` where libavcodec of the declared ABI, or
-        /// the device, is unavailable.
+        /// the device, is unavailable. The stream is framed by the decoder's own parser, so this is
+        /// the elementary-stream (Annex B) path; a container opens through [`Demuxer`] instead.
         pub fn open() -> Option<Self> {
-            let libs = Arc::new(super::ffmpeg::load()?);
+            Self::open_with(Arc::new(super::ffmpeg::load()?), ptr::null_mut())
+        }
+
+        /// Open a decoder over a container's video stream: `parameters` are the stream's codec
+        /// parameters, which carry the parameter sets a container keeps out of band. The libraries
+        /// the demuxer loaded are shared rather than loaded again.
+        fn open_demuxed(libs: Arc<Ffmpeg>, parameters: *mut c_void) -> Option<Self> {
+            Self::open_with(libs, parameters)
+        }
+
+        fn open_with(libs: Arc<Ffmpeg>, parameters: *mut c_void) -> Option<Self> {
             let symbols = Symbols::resolve(&libs)?;
-            match unsafe { Self::open_inner(libs, symbols) } {
+            match unsafe { Self::open_inner(libs, symbols, parameters) } {
                 Ok(decoder) => Some(decoder),
                 Err(error) => {
                     log::warn!("gpui_va: opening the decoder: {error:#}");
@@ -978,7 +1285,11 @@ mod codec {
             }
         }
 
-        unsafe fn open_inner(libs: Arc<Ffmpeg>, symbols: Symbols) -> anyhow::Result<Self> {
+        unsafe fn open_inner(
+            libs: Arc<Ffmpeg>,
+            symbols: Symbols,
+            parameters: *mut c_void,
+        ) -> anyhow::Result<Self> {
             let mut decoder = Self {
                 libs,
                 symbols,
@@ -988,6 +1299,7 @@ mod codec {
                 packet: ptr::null_mut(),
                 display: ptr::null_mut(),
                 queue: VecDeque::new(),
+                not_hardware: false,
             };
             // From here any `?` drops `decoder`, freeing whatever has been built.
             let symbols = decoder.symbols;
@@ -1016,13 +1328,30 @@ mod codec {
             decoder.context = (symbols.alloc_context3)(codec);
             anyhow::ensure!(!decoder.context.is_null(), "avcodec_alloc_context3 failed");
             (*decoder.context).hw_device_ctx = (symbols.buffer_ref)(decoder.hw_device);
+            // A stream may name a profile the hwaccel has no mapping for — plain H.264 Baseline, for
+            // one, which ffmpeg maps only in its constrained form. With this flag it falls back to
+            // the closest profile the driver does support, which decodes the stream the same way,
+            // rather than refusing and silently decoding it in software (whose frames have no
+            // surface to export). See `vaapi_decode_make_config`'s profile-match handling.
+            (*decoder.context).hwaccel_flags |= AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH;
+            if !parameters.is_null() {
+                // A container keeps the parameter sets out of band, in the stream's `extradata`, and
+                // its packets are already framed — copying the parameters in is what lets those
+                // packets decode, where an elementary stream carries both in its own bytes.
+                anyhow::ensure!(
+                    (symbols.parameters_to_context)(decoder.context, parameters) >= 0,
+                    "avcodec_parameters_to_context failed"
+                );
+            }
             anyhow::ensure!(
                 (symbols.open2)(decoder.context, codec, ptr::null_mut()) >= 0,
                 "avcodec_open2 failed"
             );
 
-            decoder.parser = (symbols.parser_init)(AV_CODEC_ID_H264);
-            anyhow::ensure!(!decoder.parser.is_null(), "av_parser_init failed");
+            if parameters.is_null() {
+                decoder.parser = (symbols.parser_init)(AV_CODEC_ID_H264);
+                anyhow::ensure!(!decoder.parser.is_null(), "av_parser_init failed");
+            }
             decoder.packet = (symbols.packet_alloc)();
             anyhow::ensure!(!decoder.packet.is_null(), "av_packet_alloc failed");
             Ok(decoder)
@@ -1031,6 +1360,10 @@ mod codec {
         /// Feed `chunk` of the elementary stream: its access units are parsed out and sent to the
         /// decoder, ready for [`Decoder::receive`].
         pub fn send(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                !self.parser.is_null(),
+                "this decoder is fed demuxed packets, not an elementary stream"
+            );
             let mut data = chunk;
             while !data.is_empty() {
                 let (out, out_size, used) = self.parse(data)?;
@@ -1045,14 +1378,29 @@ mod codec {
         /// End the stream: the parser's last access unit is only emitted now, then the decoder is
         /// flushed. After this, drain [`Decoder::receive`] until it yields `None`.
         pub fn finish(&mut self) -> anyhow::Result<()> {
-            loop {
-                let (out, out_size, _) = self.parse(&[])?;
-                if out_size <= 0 {
-                    break;
+            // A container framed every packet already, so only the decoder itself is flushed.
+            if !self.parser.is_null() {
+                loop {
+                    let (out, out_size, _) = self.parse(&[])?;
+                    if out_size <= 0 {
+                        break;
+                    }
+                    self.send_access_unit(out, out_size)?;
                 }
-                self.send_access_unit(out, out_size)?;
             }
             unsafe { (self.symbols.send_packet)(self.context, ptr::null()) };
+            self.pump();
+            Ok(())
+        }
+
+        /// Feed one packet a container framed, ready for [`Decoder::receive`]. The decoder references
+        /// the packet, so the demuxer may release it as soon as this returns.
+        fn send_packet(&mut self, packet: *mut AvPacket) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                unsafe { (self.symbols.send_packet)(self.context, packet) } >= 0,
+                "avcodec_send_packet failed"
+            );
+            // Drain what this packet produced, so the next send is accepted.
             self.pump();
             Ok(())
         }
@@ -1123,10 +1471,30 @@ mod codec {
                 unsafe { (self.symbols.frame_free)(&mut frame) };
                 return None;
             }
-            let surface = unsafe { (*frame).data[3] as usize as u32 };
-            let (colorspace, color_range, height) = unsafe {
-                ((*frame).colorspace, (*frame).color_range, (*frame).height)
+            let (colorspace, color_range, height, format) = unsafe {
+                (
+                    (*frame).colorspace,
+                    (*frame).color_range,
+                    (*frame).height,
+                    (*frame).format,
+                )
             };
+            if format != AV_PIX_FMT_VAAPI {
+                // The driver would not hardware-decode the stream and fell back to software, whose
+                // frames live in ordinary memory rather than a VA surface — there is nothing to
+                // export as a dma-buf, so the frame cannot reach the renderer.
+                if !self.not_hardware {
+                    self.not_hardware = true;
+                    log::warn!(
+                        "gpui_va: the driver did not hardware-decode this stream and fell back to \
+                         software; software frames cannot be exported as a dma-buf, so there is \
+                         nothing to composite."
+                    );
+                }
+                unsafe { (self.symbols.frame_free)(&mut frame) };
+                return None;
+            }
+            let surface = unsafe { (*frame).data[3] as usize as u32 };
             let color_space = color_space(colorspace, color_range, height);
             match va::export(self.display, surface) {
                 Ok(handle) => Some(Frame {
@@ -1179,6 +1547,126 @@ mod codec {
         fn drop(&mut self) {
             // SAFETY: the frame is one this decoder allocated; the free returns its surface to the pool.
             unsafe { (self.symbols.frame_free)(&mut self.frame) };
+        }
+    }
+
+    /// A container (or a raw elementary stream in a file) opened through libavformat: it hands the
+    /// decoder one framed packet at a time, so a container plays through the same bounded path an
+    /// elementary stream does.
+    ///
+    /// libavformat detects the format, finds the video stream and reads its codec parameters — the
+    /// parameter sets a container keeps out of band — which a [`Decoder`] is then opened from. The
+    /// demuxer keeps its file open, owns the packet it reads, and releases it once the decoder has
+    /// referenced it.
+    pub struct Demuxer {
+        libs: Arc<Ffmpeg>,
+        symbols: FormatSymbols,
+        format: *mut AvFormatContext,
+        packet: *mut AvPacket,
+        /// The video stream's codec parameters, valid for as long as `format` is open.
+        parameters: *mut c_void,
+        /// The stream's average frame rate, for pacing playback.
+        frame_rate: AvRational,
+    }
+
+    impl Demuxer {
+        /// Open the file at `path` through libavformat, or `None` where libavformat of the declared
+        /// ABI is not installed, the file cannot be opened, or it carries no video stream.
+        pub fn open(path: &Path) -> Option<Self> {
+            let libs = Arc::new(super::ffmpeg::load()?);
+            let symbols = FormatSymbols::resolve(&libs)?;
+            match unsafe { Self::open_inner(libs, symbols, path) } {
+                Ok(demuxer) => Some(demuxer),
+                Err(error) => {
+                    log::warn!("gpui_va: opening a container: {error:#}");
+                    None
+                }
+            }
+        }
+
+        unsafe fn open_inner(
+            libs: Arc<Ffmpeg>,
+            symbols: FormatSymbols,
+            path: &Path,
+        ) -> anyhow::Result<Self> {
+            let url = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+                .map_err(|_| anyhow::anyhow!("the path is not a valid C string"))?;
+            let mut format: *mut AvFormatContext = ptr::null_mut();
+            anyhow::ensure!(
+                (symbols.open_input)(&mut format, url.as_ptr(), ptr::null(), ptr::null_mut()) >= 0,
+                "avformat_open_input failed"
+            );
+            let mut demuxer = Self {
+                libs,
+                symbols,
+                format,
+                packet: ptr::null_mut(),
+                parameters: ptr::null_mut(),
+                frame_rate: AvRational { num: 0, den: 0 },
+            };
+            // From here any `?` drops `demuxer`, closing the format.
+            anyhow::ensure!(
+                (demuxer.symbols.find_stream_info)(demuxer.format, ptr::null_mut()) >= 0,
+                "avformat_find_stream_info failed"
+            );
+            let index = (demuxer.symbols.find_best_stream)(
+                demuxer.format,
+                AVMEDIA_TYPE_VIDEO,
+                -1,
+                -1,
+                ptr::null_mut(),
+                0,
+            );
+            anyhow::ensure!(index >= 0, "the container carries no video stream");
+            let context = &*demuxer.format;
+            anyhow::ensure!(
+                (index as u32) < context.nb_streams,
+                "the video stream index is past the stream table"
+            );
+            let stream = &**context.streams.add(index as usize);
+            anyhow::ensure!(!stream.codecpar.is_null(), "the video stream has no parameters");
+            demuxer.parameters = stream.codecpar;
+            demuxer.frame_rate = stream.avg_frame_rate;
+            demuxer.packet = (demuxer.symbols.packet_alloc)();
+            anyhow::ensure!(!demuxer.packet.is_null(), "av_packet_alloc failed");
+            Ok(demuxer)
+        }
+
+        /// Open a decoder over this container's video stream, on the libraries the demuxer loaded.
+        pub fn decoder(&self) -> Option<Decoder> {
+            Decoder::open_demuxed(self.libs.clone(), self.parameters)
+        }
+
+        /// Read the next packet and hand it to `decoder` — a container frames its packets already, so
+        /// they go in ahead of any parser. `Ok(false)` at the end of the stream; an error only where
+        /// the decoder refused a packet.
+        pub fn send_next(&mut self, decoder: &mut Decoder) -> anyhow::Result<bool> {
+            // SAFETY: the packet is one this demuxer allocated; releasing it before re-reading keeps
+            // the next read from overwriting a buffer still in use, and it accepts a released packet.
+            unsafe { (self.symbols.packet_unref)(self.packet) };
+            if unsafe { (self.symbols.read_frame)(self.format, self.packet) } < 0 {
+                return Ok(false);
+            }
+            decoder.send_packet(self.packet)?;
+            Ok(true)
+        }
+
+        /// The stream's average frame period, where the container declares one, so a player can pace
+        /// playback at the rate the stream was authored at.
+        pub fn frame_period(&self) -> Option<Duration> {
+            let (num, den) = (self.frame_rate.num, self.frame_rate.den);
+            (num > 0 && den > 0).then(|| Duration::from_secs_f64(f64::from(den) / f64::from(num)))
+        }
+    }
+
+    impl Drop for Demuxer {
+        fn drop(&mut self) {
+            // SAFETY: the packet is one this demuxer allocated; closing the format frees its streams,
+            // so the parameters pointer must not outlive this.
+            unsafe {
+                (self.symbols.packet_free)(&mut self.packet);
+                (self.symbols.close_input)(&mut self.format);
+            }
         }
     }
 
@@ -1462,6 +1950,45 @@ mod tests {
         assert_eq!(handle.plane_count(), 2);
     }
 
+    /// A plain-baseline H.264 stream — profile 66, which ffmpeg's VA-API hwaccel has no exact mapping
+    /// for — still decodes in hardware: the decoder opts into a profile mismatch, so it uses the
+    /// closest profile the driver supports rather than refusing and falling back to software, where
+    /// no surface could be exported. The raw stream and a container both reach a tiled surface.
+    #[test]
+    fn a_plain_baseline_stream_decodes_in_hardware() {
+        let Some(frame) = decode(BASELINE) else {
+            eprintln!(
+                "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
+            );
+            return;
+        };
+        let handle = frame.handle();
+        assert_eq!((handle.width, handle.height), (128, 128));
+        assert_ne!(
+            handle.modifier,
+            DmaBufHandle::LINEAR,
+            "a hardware-decoded surface is tiled"
+        );
+        assert_eq!(handle.plane_count(), 2);
+
+        // The same stream behind a file, the route the player takes: a raw elementary stream, whose
+        // parameter set rides in the packets, and a container, whose profile comes from its own
+        // `avcC` — the case where the hwaccel's refusal once left nothing to composite.
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        for fixture in ["baseline.h264", "baseline.mp4"] {
+            let Some(mut playback) = Playback::open_path(&fixtures.join(fixture), 2) else {
+                panic!("{fixture} did not decode");
+            };
+            for _ in 0..3 {
+                let handle = playback
+                    .next()
+                    .unwrap_or_else(|| panic!("a frame from {fixture}"));
+                assert_eq!((handle.width, handle.height), (128, 128), "{fixture}");
+                signal(&handle);
+            }
+        }
+    }
+
     /// The decoder reads the stream's colour space off the frame and declares it on the exported
     /// handle: a full-range stream stays full, a limited-range one is declared limited. Without this
     /// a real stream's limited bytes would be read as full range and play washed out.
@@ -1588,6 +2115,74 @@ mod tests {
         assert!(
             playback.position() > 2,
             "releasing lets it advance, at {}",
+            playback.position()
+        );
+    }
+
+    /// The checked-in container fixture: the clip muxed into MP4, which frames its packets from the
+    /// stream's `extradata` rather than in band, so it decodes only through the demuxer path.
+    const FIXTURE_MP4: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/fixtures/clip.mp4");
+
+    /// libavformat opens the container, finds its video stream, and reads the parameters a decoder is
+    /// then opened from — the shape a player needs before it decodes anything.
+    #[test]
+    fn a_container_demuxes_to_its_video_stream() {
+        let Some(demuxer) = Demuxer::open(Path::new(FIXTURE_MP4)) else {
+            eprintln!("skipping: libavformat of the declared ABI is unavailable");
+            return;
+        };
+        let period = demuxer
+            .frame_period()
+            .expect("the container declares a frame rate");
+        assert!(
+            (period.as_secs_f64() - 0.040).abs() < 1e-3,
+            "the clip is 25 fps, saw {period:?}"
+        );
+    }
+
+    /// A container plays through the same bounded path an elementary stream does: every frame is a
+    /// tiled surface carrying the stream's colour space, kept bounded and recycled as the playback
+    /// loops.
+    #[test]
+    fn a_container_plays_through_the_bounded_playback() {
+        use gpui_engine::{YuvColorSpace, YuvMatrix, YuvRange};
+
+        let Some(mut playback) = Playback::open_path(Path::new(FIXTURE_MP4), 3) else {
+            eprintln!(
+                "skipping: libavformat/libavcodec of the declared ABI, or the VA-API device, is \
+                 unavailable"
+            );
+            return;
+        };
+
+        let mut peak = 0;
+        let mut first = true;
+        for _ in 0..200 {
+            let Some(handle) = playback.next() else {
+                break;
+            };
+            assert_eq!((handle.width, handle.height), (256, 144));
+            assert_ne!(handle.modifier, DmaBufHandle::LINEAR, "a decoded frame is tiled");
+            if first {
+                first = false;
+                // The clip is full-range BT.601, and the colour space is read through the container
+                // exactly as it is off a raw stream.
+                assert_eq!(
+                    handle.color_space,
+                    YuvColorSpace {
+                        matrix: YuvMatrix::Bt601,
+                        range: YuvRange::Full,
+                    },
+                );
+            }
+            peak = peak.max(playback.live());
+            signal(&handle);
+        }
+
+        assert!(peak <= 3, "at most `depth` frames live, saw {peak}");
+        assert!(
+            playback.position() > 60,
+            "the playback looped past the clip's 60 frames, at {}",
             playback.position()
         );
     }
