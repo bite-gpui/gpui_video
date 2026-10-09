@@ -1,0 +1,21 @@
+[package]
+name = "gpui_video"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_video.rs"
+doctest = false
+
+[dependencies]
+# The authoring half of the element API — `gpu_canvas`, `Render`, `Context` — and, re-exported through
+# it, `gpui_engine`'s `SurfaceSource`. Not the facade: an element depends on the authoring crate, the
+# way `gpui_authoring`'s own elements do.
+gpui_authoring.workspace = true
+# The producer seam. This is the only thing the element knows about what feeds it.
+gpui_surface_producer.workspace = true
