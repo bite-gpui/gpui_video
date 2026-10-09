@@ -1,0 +1,18 @@
+[package]
+name = "gpui_surface_producer"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "Apache-2.0"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/gpui_surface_producer.rs"
+doctest = false
+
+[dependencies]
+# The consumer's half of the seam: `SurfaceSource` and the format vocabulary it is read with. This
+# crate adds the producer's half and nothing else, so it depends on the engine and on no graphics API.
+gpui_engine.workspace = true
