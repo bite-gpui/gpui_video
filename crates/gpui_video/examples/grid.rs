@@ -21,26 +21,31 @@
 //! as a fraction of a core. The readback path additionally uploads each frame on the UI thread, which
 //! those figures do not count — the render fps (from the instrumented pipeline) is where an upload
 //! cost shows up. The header also shows the process's RSS and thread count, so a leak shows as RSS
-//! that will not settle. `GPUI_GRID_AUTOFLIP=<secs>` flips to readback at `<secs>` and back at twice
-//! that, to exercise the round-trip without clicking.
+//! that will not settle. `GPUI_GRID_AUTOFLIP=<secs>` flips the handover every `<secs>` seconds, to
+//! exercise the round-trip without clicking.
 //!
 //! A wall of hundreds presents through a per-render budget: at most `GPUI_GRID_BUDGET` panes (default
 //! [`BUDGET`]) advance in one frame, taking turns, so the UI thread's per-render layout and upload
 //! stay bounded however fast the workers are, and the panes play at a shared rate rather than the
 //! wall dropping to a few frames a second. `GPUI_GRID_BUDGET=0` lifts the cap.
+//!
+//! The figures are a translucent panel over the wall: the render rate, the per-pane rate, and the
+//! process's RAM and VRAM and thread count. VRAM is the kernel's own per-client DRM accounting, read
+//! from `fdinfo`, so it sees what the renderer and the video engine have reserved without reaching
+//! into either; on an integrated part it is system memory the GPU has reserved, not a separate pool.
 
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Bounds, Context, FramePipelineExt, ImageSource, IntoElement, ObjectFit,
     ParentElement, PhaseMetrics, Render, RenderImage, StatefulInteractiveElement,
     StandardImmediatePipeline, Styled, SurfaceSource, Window, WindowBounds, WindowOptions, div,
-    img, prelude::*, px, rgb, size, surface,
+    img, prelude::*, px, rgb, rgba, size, surface,
 };
 use gpui_video_platform::SurfaceProducer;
 
@@ -48,10 +53,9 @@ use gpui_va::{Demuxer, Playback};
 
 /// How many frames a zero-copy pane may keep alive at once.
 const DEPTH: usize = 3;
-/// Gap between panes and page padding, and the header's height.
+/// Gap between panes and page padding.
 const GAP: f32 = 4.0;
 const PAD: f32 = 8.0;
-const HEADER_H: f32 = 40.0;
 /// The window's size when `--size` is not given. The grid fills it, its cells share it equally, and
 /// each frame is scaled proportionally (letterboxed) into its cell.
 const WINDOW_W: f32 = 1280.0;
@@ -170,6 +174,8 @@ struct Grid {
     metrics: Arc<Metrics>,
     /// The frame pipeline's own timing, for the render rate.
     phases: Rc<RefCell<PhaseMetrics>>,
+    /// How many drain tasks are still live, so a leak shows as a count that will not settle.
+    live_tasks: Arc<AtomicUsize>,
     /// The last worker reading, for a per-second delta.
     snapshot: (u64, u64, Instant),
     /// The last render-frame count and pass times, for a per-second delta.
@@ -206,6 +212,12 @@ struct Readout {
     ms_per_frame: f64,
     /// The workers' work a second, as a fraction of one core.
     cores: f64,
+    /// The process's RAM (resident) and VRAM (GPU-attributed) memory, in MiB, and its thread count,
+    /// sampled once a second alongside the rates. On an integrated part, VRAM is system memory the
+    /// GPU has reserved rather than a separate pool.
+    ram_mib: f64,
+    vram_mib: f64,
+    threads: usize,
 }
 
 impl Grid {
@@ -226,10 +238,16 @@ impl Grid {
             cell: cell_size(window, cols, rows),
             mode,
             metrics: Arc::new(Metrics::default()),
+            live_tasks: Arc::new(AtomicUsize::new(0)),
             phases,
             snapshot: (0, 0, Instant::now()),
             phases_snapshot: (PhaseMetrics::default(), Instant::now()),
-            readout: Readout::default(),
+            readout: Readout {
+                ram_mib: process_rss_mib(),
+                vram_mib: process_gpu_mib(),
+                threads: process_threads(),
+                ..Readout::default()
+            },
             replaced: Vec::new(),
             budget: pane_budget(),
             cursor: 0,
@@ -277,6 +295,9 @@ impl Grid {
                 continue;
             }
 
+            let live = self.live_tasks.clone();
+            self.live_tasks.fetch_add(1, Ordering::Relaxed);
+
             cx.spawn(async move |this, cx| {
                 while let Ok(event) = from_worker.recv_async().await {
                     if this
@@ -289,6 +310,7 @@ impl Grid {
                         break;
                     }
                 }
+                live.fetch_sub(1, Ordering::Relaxed);
             })
             .detach();
 
@@ -394,10 +416,13 @@ impl Grid {
                 self.readout.render_layout_ms = per(phases.layout, last.layout);
                 self.readout.render_paint_ms = per(phases.paint, last.paint);
             }
+            self.readout.ram_mib = process_rss_mib();
+            self.readout.vram_mib = process_gpu_mib();
+            self.readout.threads = process_threads();
             self.phases_snapshot = (phases, Instant::now());
             eprintln!(
                 "grid: {} panes, {} — render {:.0} fps (eval {:.2} layout {:.2} paint {:.2} ms/frame); \
-                 panes {:.0} frames/s ({:.1}/pane), {:.2} ms/frame, {:.0}% of a core; {:.0} MiB rss, {} threads",
+                 panes {:.0} frames/s ({:.1}/pane), {:.2} ms/frame, {:.0}% of a core; {:.0} MiB ram, {:.0} MiB vram, {} threads, {} tasks",
                 self.panes.len(),
                 self.mode.label(),
                 self.readout.render_fps,
@@ -408,8 +433,10 @@ impl Grid {
                 self.readout.pane_fps / self.panes.len().max(1) as f64,
                 self.readout.ms_per_frame,
                 self.readout.cores * 100.0,
-                process_rss_mib(),
-                process_threads(),
+                self.readout.ram_mib,
+                self.readout.vram_mib,
+                self.readout.threads,
+                self.live_tasks.load(Ordering::Relaxed),
             );
         }
     }
@@ -424,14 +451,11 @@ impl Render for Grid {
         }
         if let Some(at) = self.autoflip {
             let elapsed = self.started.elapsed().as_secs_f64();
-            if self.flips == 0 && elapsed >= at {
-                self.flips = 1;
+            let flips = (elapsed / at) as u32;
+            if flips > self.flips {
+                self.flips = flips;
                 self.switch_mode(cx);
-                eprintln!("grid: autoflip -> {}", self.mode.label());
-            } else if self.flips == 1 && elapsed >= 2.0 * at {
-                self.flips = 2;
-                self.switch_mode(cx);
-                eprintln!("grid: autoflip -> {}", self.mode.label());
+                eprintln!("grid: autoflip {flips} -> {}", self.mode.label());
             }
         }
         // Ask for the next frame of at most `budget` due panes, taking turns from where the last
@@ -445,34 +469,47 @@ impl Render for Grid {
 
         let toggle = cx.entity();
         let readout = &self.readout;
-        let header = div()
+        // The readout floats over the wall, on a translucent panel, so the panes get the whole
+        // window and the numbers sit over the video rather than beside it.
+        let overlay = div()
+            .absolute()
+            .top(px(PAD))
+            .left(px(PAD))
             .flex()
-            .items_center()
-            .gap_4()
+            .flex_col()
+            .gap_1()
             .px_3()
             .py_2()
-            .bg(rgb(0x1c1c24))
+            .rounded_md()
+            .bg(rgba(0x101014d9))
             .text_color(rgb(0xe0e0e8))
             .text_sm()
             .child(
-                div()
-                    .id("grid-mode")
-                    .px_3()
-                    .py_1()
-                    .rounded_md()
-                    .bg(self.mode.accent())
-                    .cursor_pointer()
-                    .child(self.mode.label())
-                    .on_click(move |_, _window, cx| {
-                        toggle.update(cx, |grid, cx| grid.switch_mode(cx));
-                    }),
+                div().flex().child(
+                    div()
+                        .id("grid-mode")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(self.mode.accent())
+                        .cursor_pointer()
+                        .child(self.mode.label())
+                        .on_click(move |_, _window, cx| {
+                            toggle.update(cx, |grid, cx| grid.switch_mode(cx));
+                        }),
+                ),
             )
-            .child(format!("{} panes ({}x{})", self.panes.len(), self.cols, self.rows))
-            .child(if self.budget == 0 {
-                "budget off".to_string()
-            } else {
-                format!("budget {}/render", self.budget.min(self.panes.len()))
-            })
+            .child(format!(
+                "{} panes ({}x{}) · {}",
+                self.panes.len(),
+                self.cols,
+                self.rows,
+                if self.budget == 0 {
+                    "budget off".to_string()
+                } else {
+                    format!("budget {}/render", self.budget.min(self.panes.len()))
+                },
+            ))
             .child(format!(
                 "render {:.0} fps (eval {:.1} + layout {:.1} + paint {:.1} ms)",
                 readout.render_fps,
@@ -486,6 +523,10 @@ impl Render for Grid {
                 readout.pane_fps / self.panes.len().max(1) as f64,
                 readout.ms_per_frame,
                 readout.cores * 100.0,
+            ))
+            .child(format!(
+                "ram {:.0} MiB · vram {:.0} MiB · {} threads",
+                readout.ram_mib, readout.vram_mib, readout.threads,
             ));
 
         let mut rows = Vec::with_capacity(self.rows);
@@ -501,12 +542,11 @@ impl Render for Grid {
 
         div()
             .size_full()
-            .flex()
-            .flex_col()
+            .relative()
             .bg(rgb(0x101014))
-            .child(header.h(px(HEADER_H)))
             .child(
                 div()
+                    .size_full()
                     .flex()
                     .flex_col()
                     .gap(px(GAP))
@@ -514,6 +554,7 @@ impl Render for Grid {
                     .overflow_hidden()
                     .children(rows),
             )
+            .child(overlay)
     }
 }
 
@@ -544,7 +585,7 @@ fn pane_view(pane: &Pane, cell: (f32, f32)) -> AnyElement {
 /// the gaps, padding and header.
 fn cell_size(window: (f32, f32), cols: usize, rows: usize) -> (f32, f32) {
     let inner_w = window.0 - 2.0 * PAD - (cols.saturating_sub(1)) as f32 * GAP;
-    let inner_h = window.1 - HEADER_H - 2.0 * PAD - (rows.saturating_sub(1)) as f32 * GAP;
+    let inner_h = window.1 - 2.0 * PAD - (rows.saturating_sub(1)) as f32 * GAP;
     (
         (inner_w / cols as f32).max(1.0),
         (inner_h / rows as f32).max(1.0),
@@ -719,6 +760,51 @@ fn process_rss_mib() -> f64 {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     pages as f64 * 4096.0 / (1024.0 * 1024.0)
+}
+
+/// This process's GPU memory, in MiB, from the DRM clients it holds.
+///
+/// The kernel accounts, per client, every buffer a DRM client has allocated — what the Vulkan
+/// renderer and the video engine reserve — and reports it in that client's descriptor `fdinfo`,
+/// under `drm-total-<region>`, in KiB. Several descriptors can name one client (a device dup'd for
+/// each decoder), so each client is totalled once; several clients (one per decoder) are each
+/// counted, which is exactly the point.
+fn process_gpu_mib() -> f64 {
+    use std::collections::HashMap;
+
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return 0.0;
+    };
+    let mut clients: HashMap<u64, u64> = HashMap::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        // `/proc/self/fd/N` is a symlink to the target, so read the shadow `fdinfo` entry instead.
+        let Ok(info) = std::fs::read_to_string(format!("/proc/self/fdinfo/{name}")) else {
+            continue;
+        };
+        let mut client = None;
+        let mut kib = 0u64;
+        for line in info.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            if key == "drm-client-id" {
+                client = value.trim().parse().ok();
+            } else if key.starts_with("drm-total-") {
+                // The kernel prints the value in KiB, with the unit after the number.
+                let number = value.trim().split_whitespace().next().unwrap_or("");
+                if let Ok(v) = number.parse::<u64>() {
+                    kib += v;
+                }
+            }
+        }
+        if let Some(client) = client {
+            clients.insert(client, kib);
+        }
+    }
+    clients.values().sum::<u64>() as f64 / 1024.0
 }
 
 /// This process's thread count, from `/proc/self/status`.
