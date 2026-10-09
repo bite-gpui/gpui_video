@@ -26,7 +26,7 @@
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -104,10 +104,10 @@ pub fn decode(bitstream: &[u8]) -> Option<Frame> {
     codec::decode(bitstream)
 }
 
-pub use codec::{Decoder, Demuxer, Frame};
+pub use codec::{CpuFrame, Decoder, Demuxer, Frame, Readback, ReadbackFrame, StagedReadback};
 
 /// The producer seam: a playback hands the surface path each decoded frame as its period comes due.
-impl gpui_surface_producer::SurfaceProducer for Playback {
+impl gpui_video_platform::SurfaceProducer for Playback {
     fn surface(&mut self) -> Option<gpui_engine::SurfaceSource> {
         self.next().map(Into::into)
     }
@@ -141,6 +141,12 @@ pub struct Playback {
     depth: usize,
     /// How many frames have been handed out, across loops.
     position: u64,
+    /// While decoding forward to a seek target: that target in the stream's time base. Frames before
+    /// it are dropped rather than shown, so a seek lands on the frame asked for, not its keyframe.
+    seek_target: Option<i64>,
+    /// The newest frame decoded before a seek target, kept so a seek past the last frame shows the
+    /// closest frame rather than restarting the stream from the top.
+    behind: Option<Frame>,
 }
 
 /// Where a playback's packets come from.
@@ -156,8 +162,6 @@ enum Source {
     /// A file read through libavformat, which frames its packets itself.
     Container {
         demuxer: Demuxer,
-        /// The file's path, so the stream can be re-opened when it loops.
-        path: PathBuf,
         /// Whether the decoder has been flushed for this pass.
         ended: bool,
     },
@@ -175,6 +179,10 @@ const FEED_CHUNK: usize = 512;
 
 /// The fewest frames a playback may keep alive: one on screen, one to hand out next.
 const MIN_DEPTH: usize = 2;
+
+/// How many packets one fill may decode while seeking forward to a target from the keyframe before it.
+/// A seek can cross a whole GOP, so the work is bounded by the file rather than by the queue depth.
+const SEEK_BUDGET: usize = 16_384;
 
 /// What one feed step did.
 enum Fed {
@@ -213,7 +221,6 @@ impl Playback {
         let mut playback = Self::new(
             Source::Container {
                 demuxer,
-                path: path.to_owned(),
                 ended: false,
             },
             decoder,
@@ -232,6 +239,8 @@ impl Playback {
             current: None,
             depth: depth.max(MIN_DEPTH),
             position: 0,
+            seek_target: None,
+            behind: None,
         }
     }
 
@@ -243,6 +252,46 @@ impl Playback {
             Source::Stream { .. } => None,
             Source::Container { demuxer, .. } => demuxer.frame_period(),
         }
+    }
+
+    /// How long the source is, where it declares a duration: a container knows its length; a raw
+    /// in-memory stream does not.
+    pub fn duration(&self) -> Option<Duration> {
+        match &self.source {
+            Source::Stream { .. } => None,
+            Source::Container { demuxer, .. } => demuxer.duration(),
+        }
+    }
+
+    /// Whether [`seek`](Self::seek) lands: a container can be seeked through libavformat; a raw
+    /// in-memory elementary stream has no index to seek in.
+    pub fn is_seekable(&self) -> bool {
+        matches!(self.source, Source::Container { .. })
+    }
+
+    /// Move playback to `to`: seek the demuxer, flush the decoder — which invalidates everything it
+    /// buffered — drop the frames not yet handed out, and decode forward to the frame at `to`. The
+    /// seek itself lands on the keyframe at or before `to`, so the frame asked for is reached by
+    /// decoding past the frames between them (see [`fill`](Self::fill)); `false` where the source
+    /// cannot seek.
+    pub fn seek(&mut self, to: Duration) -> bool {
+        let target = match &mut self.source {
+            Source::Stream { .. } => return false,
+            Source::Container { demuxer, ended, .. } => {
+                let Some(target) = demuxer.seek(to) else {
+                    return false;
+                };
+                // The container is no longer at its end: the next read continues from `to`.
+                *ended = false;
+                target
+            }
+        };
+        self.decoder.flush();
+        self.queued.clear();
+        self.behind = None;
+        self.seek_target = Some(target);
+        self.fill();
+        true
     }
 
     /// The next frame to show, or the one already showing while the consumer has not released it.
@@ -318,6 +367,9 @@ impl Playback {
     fn fill(&mut self) {
         let mut budget = match &self.source {
             Source::Stream { bytes, .. } => 2 * (bytes.len() / FEED_CHUNK + 2),
+            // Decoding forward to a seek target can cross a whole GOP, so give it the seek budget;
+            // an ordinary fill only needs enough to top the queue up.
+            Source::Container { .. } if self.seek_target.is_some() => SEEK_BUDGET,
             Source::Container { .. } => 2 * (self.depth + 8),
         };
         while self.queued.len() < self.depth && budget > 0 {
@@ -326,11 +378,20 @@ impl Playback {
             match self.feed() {
                 Fed::Worked => {}
                 Fed::Stalled => return,
-                Fed::Drained => self.restart(),
+                Fed::Drained => {
+                    // Seeking past the last frame: show the closest frame before the target rather
+                    // than restarting the stream from the top.
+                    if let Some(frame) = self.behind.take() {
+                        self.seek_target = None;
+                        self.queued.push_back(frame);
+                        return;
+                    }
+                    self.restart();
+                }
             }
             while self.queued.len() < self.depth {
                 match self.decoder.receive() {
-                    Some(frame) => self.queued.push_back(frame),
+                    Some(frame) => self.keep(frame),
                     None => break,
                 }
             }
@@ -338,6 +399,25 @@ impl Playback {
                 return;
             }
         }
+    }
+
+    /// Queue a decoded frame. While a seek is being resolved, a frame before the target is dropped —
+    /// keeping only the newest of them, so a seek past the last frame still has one to show — and a
+    /// frame at or after the target ends the seek, so the frame asked for is the one presented.
+    fn keep(&mut self, frame: Frame) {
+        if let Some(target) = self.seek_target {
+            match frame.pts() {
+                Some(pts) if pts < target => {
+                    self.behind = Some(frame);
+                    return;
+                }
+                _ => {
+                    self.seek_target = None;
+                    self.behind = None;
+                }
+            }
+        }
+        self.queued.push_back(frame);
     }
 
     /// One step of pulling from the source: hand the decoder the next unit, end the source, or report
@@ -380,22 +460,20 @@ impl Playback {
         }
     }
 
-    /// Begin the source again, so a drained playback loops.
+    /// Begin the source again, so a drained playback loops. The decoder is reused — the parser reset,
+    /// the container rewound — rather than reopened: a fresh decoder builds a fresh VA-API device and
+    /// surface pool on every loop, which the driver does not hand back, so a wall of looping panes
+    /// leaks steadily and ends up memory-bound.
     fn restart(&mut self) {
         match &mut self.source {
             Source::Stream { fed, ended, .. } => {
-                if let Some(decoder) = Decoder::open() {
-                    self.decoder = decoder;
-                    *fed = 0;
-                    *ended = false;
-                }
+                self.decoder.rewind();
+                *fed = 0;
+                *ended = false;
             }
-            Source::Container { demuxer, path, ended } => {
-                if let Some(fresh) = Demuxer::open(path.as_path())
-                    && let Some(decoder) = fresh.decoder()
-                {
-                    self.decoder = decoder;
-                    *demuxer = fresh;
+            Source::Container { demuxer, ended } => {
+                if demuxer.seek(Duration::ZERO).is_some() {
+                    self.decoder.rewind();
                     *ended = false;
                 }
             }
@@ -733,17 +811,18 @@ fn fill_tiled(handle: &DmaBufHandle, colour: [u8; 4]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The version gate for `libavcodec`/`libavutil`/`libavformat`, and where their symbols are
-/// resolved.
+/// The version gate for `libavcodec`/`libavutil`/`libavformat`/`libswscale`, and where their symbols
+/// are resolved.
 ///
 /// ffmpeg bumps a library's soname exactly when its ABI changes, so `libavcodec.so.62` *is* the ABI
 /// version — and the versioned declarations this crate carries are written against it. Loading that
 /// soname, then resolving a symbol *by version tag* (`LIBAVCODEC_62`), refuses a library that is
 /// present but not the ABI declared for, rather than mis-reading its structs.
 ///
-/// `libavformat` is held to the same gate but is optional: it is what opens a container, while the
-/// elementary-stream decode stands without it, so a machine that has only `libavcodec` still plays a
-/// raw stream.
+/// `libavformat` and `libswscale` are held to the same gate but are optional: `libavformat` is what
+/// opens a container, while the elementary-stream decode stands without it, so a machine that has only
+/// `libavcodec` still plays a raw stream; `libswscale` accelerates the readback's software convert,
+/// while the scalar converter stands without it, so such a machine reads back slower, not wrongly.
 mod ffmpeg {
     use std::ffi::{CString, c_char, c_int, c_void};
 
@@ -751,6 +830,11 @@ mod ffmpeg {
     ///
     /// libavcodec 62 / libavutil 60 / libavformat 62 is ffmpeg 8.0.
     const ABI: (u32, u32, u32) = (62, 60, 62);
+
+    /// The `libswscale` major the declarations are written against (`libswscale.so.9` is ffmpeg 8.0).
+    /// Held out of [`ABI`] because the software convert it accelerates is optional: a machine without
+    /// it still decodes and still reads back, only through the scalar converter.
+    const SWSCALE_ABI: u32 = 9;
 
     const RTLD_NOW: c_int = 2;
 
@@ -772,6 +856,9 @@ mod ffmpeg {
         /// Null where `libavformat` of the declared ABI is not installed, which turns containers off
         /// while leaving the elementary-stream decode working.
         format: *mut c_void,
+        /// Null where `libswscale` of the declared ABI is not installed, which turns the readback's
+        /// convert down to the scalar path while leaving the decode untouched.
+        swscale: *mut c_void,
     }
 
     impl Ffmpeg {
@@ -792,6 +879,14 @@ mod ffmpeg {
             }
             resolve(self.format, "LIBAVFORMAT", ABI.2, name)
         }
+
+        /// A symbol from `libswscale`, or `None` where it is not installed.
+        pub fn swscale_symbol(&self, name: &str) -> Option<*mut c_void> {
+            if self.swscale.is_null() {
+                return None;
+            }
+            resolve(self.swscale, "LIBSWSCALE", SWSCALE_ABI, name)
+        }
     }
 
     /// Resolve `name` in `handle` under `tag`'s ABI version — so a library that is not the declared
@@ -806,6 +901,9 @@ mod ffmpeg {
     impl Drop for Ffmpeg {
         fn drop(&mut self) {
             unsafe {
+                if !self.swscale.is_null() {
+                    dlclose(self.swscale);
+                }
                 if !self.format.is_null() {
                     dlclose(self.format);
                 }
@@ -821,7 +919,8 @@ mod ffmpeg {
     unsafe impl Sync for Ffmpeg {}
 
     /// Load the declared ABI, or `None` when `libavcodec`/`libavutil` of that ABI is not installed.
-    /// `libavformat` is loaded too where it is, and silently left out where it is not.
+    /// `libavformat` and `libswscale` are loaded too where they are, and silently left out where they
+    /// are not.
     pub fn load() -> Option<Ffmpeg> {
         let (codec_major, util_major, format_major) = ABI;
         let codec = format!("libavcodec.so.{codec_major}");
@@ -855,10 +954,19 @@ mod ffmpeg {
         } else {
             std::ptr::null_mut()
         };
+        // libswscale is optional like libavformat: it accelerates the readback's software convert,
+        // which the scalar converter otherwise does, so a machine without it is slower, not broken.
+        let swscale = format!("libswscale.so.{SWSCALE_ABI}");
+        let swscale = if probe(&swscale, "sws_scale", &format!("LIBSWSCALE_{SWSCALE_ABI}")) {
+            unsafe { dlopen(CString::new(swscale).ok()?.as_ptr(), RTLD_NOW) }
+        } else {
+            std::ptr::null_mut()
+        };
         Some(Ffmpeg {
             codec,
             util,
             format,
+            swscale,
         })
     }
 
@@ -929,6 +1037,13 @@ mod ffmpeg {
                 "LIBAVFORMAT_61"
             ));
         }
+
+        /// `libswscale` is held to the same version gate, under its own tag.
+        #[test]
+        fn the_gate_takes_libswscale_by_its_own_tag() {
+            assert!(probe("libswscale.so.9", "sws_scale", "LIBSWSCALE_9"));
+            assert!(!probe("libswscale.so.9", "sws_scale", "LIBSWSCALE_8"));
+        }
     }
 }
 
@@ -950,7 +1065,7 @@ mod codec {
     use std::path::Path;
     use std::ptr;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use gpui_engine::DmaBufHandle;
 
@@ -963,6 +1078,18 @@ mod codec {
     /// `AV_PIX_FMT_VAAPI`: the pixel format a hardware-decoded frame carries — as against the
     /// software format the driver silently falls back to when it will not take a stream.
     const AV_PIX_FMT_VAAPI: c_int = 44;
+    /// `AV_PIX_FMT_NV12`: the planar 4:2:0 format a readback transfers a hardware frame into, whose
+    /// two planes the conversion to packed pixels walks.
+    const AV_PIX_FMT_NV12: c_int = 23;
+    /// `AV_PIX_FMT_BGRA`: the packed format the readback converts those planes into — the byte order
+    /// the renderer samples (`Rgba<u8>` bytes, blue first).
+    const AV_PIX_FMT_BGRA: c_int = 28;
+    /// `SWS_BILINEAR`: libswscale's scaler, which for a same-size convert is a plain format change.
+    const SWS_BILINEAR: c_int = 2;
+    /// The `SWS_CS_*` colour-space ids `sws_getCoefficients` takes, one per matrix the engine names.
+    const SWS_CS_ITU709: c_int = 1;
+    const SWS_CS_ITU601: c_int = 5;
+    const SWS_CS_BT2020: c_int = 9;
     /// `AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH`: the opt-in that lets a hwaccel use the closest
     /// profile it supports when a stream names one it has no mapping for.
     const AV_HWACCEL_FLAG_ALLOW_PROFILE_MISMATCH: c_int = 1 << 2;
@@ -1017,20 +1144,25 @@ mod codec {
         _quirks: u32,
     }
 
-    /// `AVFrame`, of which only the fields the decode reads are named: the plane pointers, the picture
-    /// height (to pick a default matrix when the stream names none), the pixel format (to tell a
-    /// hardware frame from one the driver decoded in software), and the colour range and matrix the
-    /// decoder read from the bitstream. The offsets are the ones `clang` reports for ffmpeg 8.0 and
+    /// `AVFrame`, of which only the fields the decode and the readback read are named: the plane
+    /// pointers and line strides (a readback walks the planes), the picture size, the pixel format (to
+    /// tell a hardware frame from one the driver decoded in software), and the colour range and matrix
+    /// the decoder read from the bitstream. The offsets are the ones `clang` reports for ffmpeg 8.0 and
     /// are asserted below.
     #[repr(C)]
     struct AvFrame {
         data: [*mut u8; 8],
-        _to_height: [u8; 104 - 64],
-        _width: c_int,
+        /// The byte stride of each plane, so a readback can walk a padded plane.
+        linesize: [c_int; 8],
+        _to_width: [u8; 104 - 96],
+        width: c_int,
         height: c_int,
         _nb_samples: c_int,
         format: c_int,
-        _to_range: [u8; 280 - 120],
+        // `pict_type` (4) and `sample_aspect_ratio` (8) precede `pts`, which is 8-byte aligned.
+        _to_pts: [u8; 136 - 120],
+        pts: i64,
+        _to_range: [u8; 280 - 144],
         color_range: c_int,
         _color_primaries: c_int,
         _color_trc: c_int,
@@ -1044,6 +1176,9 @@ mod codec {
         _dts: i64,
         data: *mut u8,
         size: c_int,
+        /// The index of the stream this packet belongs to, so the demuxer can drop the packets that
+        /// are not the video's — a container interleaves its streams, and only one feeds the decoder.
+        stream_index: c_int,
     }
 
     /// `AVCodecContext`, of which `hw_device_ctx` and `hwaccel_flags` are reachable — 560 bytes in,
@@ -1072,6 +1207,12 @@ mod codec {
         _to_nb_streams: [u8; 44],
         nb_streams: u32,
         streams: *mut *mut AvStream,
+        // `nb_stream_groups`/`stream_groups` and `nb_chapters`/`chapters` come between `streams` and
+        // `url` in the declared ABI (libavformat 62), so `duration` sits past them at offset 104.
+        _to_duration: [u8; 104 - 56],
+        /// The container's duration, in `AV_TIME_BASE` (microseconds); `AV_NOPTS_VALUE` (negative)
+        /// when the format carries none — a raw elementary stream, or a live source.
+        duration: i64,
     }
 
     /// `AVStream`, of which `codecpar` — the parameters the decoder context is opened from — and the
@@ -1080,7 +1221,10 @@ mod codec {
     struct AvStream {
         _to_codecpar: [u8; 16],
         codecpar: *mut c_void,
-        _to_avg_frame_rate: [u8; 88 - 24],
+        _to_time_base: [u8; 32 - 24],
+        /// The stream's time base: what a packet or frame timestamp is measured in.
+        time_base: AvRational,
+        _to_avg_frame_rate: [u8; 88 - 40],
         avg_frame_rate: AvRational,
     }
 
@@ -1088,18 +1232,24 @@ mod codec {
         assert!(core::mem::offset_of!(AvCodecContext, hw_device_ctx) == 560);
         assert!(core::mem::offset_of!(AvCodecContext, hwaccel_flags) == 568);
         assert!(core::mem::offset_of!(AvFrame, data) == 0);
+        assert!(core::mem::offset_of!(AvFrame, linesize) == 64);
+        assert!(core::mem::offset_of!(AvFrame, width) == 104);
         assert!(core::mem::offset_of!(AvFrame, height) == 108);
         assert!(core::mem::offset_of!(AvFrame, format) == 116);
+        assert!(core::mem::offset_of!(AvFrame, pts) == 136);
         assert!(core::mem::offset_of!(AvFrame, color_range) == 280);
         assert!(core::mem::offset_of!(AvFrame, colorspace) == 292);
         assert!(core::mem::offset_of!(AvPacket, data) == 24);
         assert!(core::mem::offset_of!(AvPacket, size) == 32);
+        assert!(core::mem::offset_of!(AvPacket, stream_index) == 36);
         assert!(core::mem::offset_of!(AvBufferRef, data) == 8);
         assert!(core::mem::offset_of!(AvHwDeviceContext, hwctx) == 16);
         assert!(core::mem::offset_of!(AvVaapiDeviceContext, display) == 0);
         assert!(core::mem::offset_of!(AvFormatContext, nb_streams) == 44);
         assert!(core::mem::offset_of!(AvFormatContext, streams) == 48);
+        assert!(core::mem::offset_of!(AvFormatContext, duration) == 104);
         assert!(core::mem::offset_of!(AvStream, codecpar) == 16);
+        assert!(core::mem::offset_of!(AvStream, time_base) == 32);
         assert!(core::mem::offset_of!(AvStream, avg_frame_rate) == 88);
     };
 
@@ -1116,6 +1266,10 @@ mod codec {
     type NewPacket = unsafe extern "C" fn(*mut AvPacket, c_int) -> c_int;
     type FrameAlloc = unsafe extern "C" fn() -> *mut AvFrame;
     type FrameFree = unsafe extern "C" fn(*mut *mut AvFrame);
+    /// `av_hwframe_transfer_data`: copies a hardware frame into a software one, which is the GPU→CPU
+    /// readback a player that does not import the buffer pays for.
+    type HwFrameTransferData =
+        unsafe extern "C" fn(*mut AvFrame, *const AvFrame, c_int) -> c_int;
     type BufferRef = unsafe extern "C" fn(*mut AvBufferRef) -> *mut AvBufferRef;
     type BufferUnref = unsafe extern "C" fn(*mut *mut AvBufferRef);
     type ParserInit = unsafe extern "C" fn(c_int) -> *mut c_void;
@@ -1133,6 +1287,50 @@ mod codec {
     type ParserClose = unsafe extern "C" fn(*mut c_void);
     type ParametersToContext = unsafe extern "C" fn(*mut AvCodecContext, *const c_void) -> c_int;
     type PacketUnref = unsafe extern "C" fn(*mut AvPacket);
+    type FlushBuffers = unsafe extern "C" fn(*mut AvCodecContext);
+
+    /// `sws_getContext`: `(srcW, srcH, srcFormat, dstW, dstH, dstFormat, flags, srcFilter, dstFilter,
+    /// param)`, returning the convert context or null. The filter and parameter pointers are left null
+    /// — for a same-size convert there is nothing to filter.
+    type SwsGetContext = unsafe extern "C" fn(
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+        *mut c_void,
+        *mut c_void,
+        *const c_void,
+    ) -> *mut c_void;
+    /// `sws_scale`: `(ctx, srcSlice, srcStride, srcSliceY, srcSliceH, dst, dstStride)`, walking the
+    /// planes named by the slice arrays and returning the rows written, or negative on error.
+    type SwsScale = unsafe extern "C" fn(
+        *mut c_void,
+        *const *const u8,
+        *const c_int,
+        c_int,
+        c_int,
+        *const *mut u8,
+        *const c_int,
+    ) -> c_int;
+    type SwsFreeContext = unsafe extern "C" fn(*mut c_void);
+    /// `sws_getCoefficients`: the 16.16 fixed-point YUV↔RGB coefficients for an `SWS_CS_*` id.
+    type SwsGetCoefficients = unsafe extern "C" fn(c_int) -> *const c_int;
+    /// `sws_setColorspaceDetails`: `(ctx, invTable, srcRange, table, dstRange, brightness, contrast,
+    /// saturation)`, so the convert honours the stream's own matrix and range rather than the
+    /// default. `invTable`/`table` are the coefficient arrays from [`SwsGetCoefficients`].
+    type SwsSetColorspaceDetails = unsafe extern "C" fn(
+        *mut c_void,
+        *const c_int,
+        c_int,
+        *const c_int,
+        c_int,
+        c_int,
+        c_int,
+        c_int,
+    ) -> c_int;
 
     /// The libavformat functions that open a file, find its video stream and read its packets.
     type OpenInput = unsafe extern "C" fn(
@@ -1152,6 +1350,13 @@ mod codec {
     ) -> c_int;
     type ReadFrame = unsafe extern "C" fn(*mut AvFormatContext, *mut AvPacket) -> c_int;
     type CloseInput = unsafe extern "C" fn(*mut *mut AvFormatContext);
+    /// `av_seek_frame`: `(s, stream_index, timestamp, flags)`, the timestamp in that stream's own
+    /// time base.
+    type SeekFrame = unsafe extern "C" fn(*mut AvFormatContext, c_int, i64, c_int) -> c_int;
+
+    /// Seek to the keyframe at or before the target, so a seek lands on a frame the decoder can start
+    /// from. `AVSEEK_FLAG_BACKWARD`.
+    const AVSEEK_FLAG_BACKWARD: c_int = 1;
 
     /// The libavcodec/libavutil functions the decode calls, each resolved under the ABI version tag.
     #[derive(Clone, Copy)]
@@ -1168,12 +1373,14 @@ mod codec {
         new_packet: NewPacket,
         frame_alloc: FrameAlloc,
         frame_free: FrameFree,
+        hwframe_transfer_data: HwFrameTransferData,
         buffer_ref: BufferRef,
         buffer_unref: BufferUnref,
         parser_init: ParserInit,
         parser_parse2: ParserParse2,
         parser_close: ParserClose,
         parameters_to_context: ParametersToContext,
+        flush_buffers: FlushBuffers,
     }
 
     impl Symbols {
@@ -1201,12 +1408,14 @@ mod codec {
                 new_packet: symbol(libs, false, "av_new_packet")?,
                 frame_alloc: symbol(libs, true, "av_frame_alloc")?,
                 frame_free: symbol(libs, true, "av_frame_free")?,
+                hwframe_transfer_data: symbol(libs, true, "av_hwframe_transfer_data")?,
                 buffer_ref: symbol(libs, true, "av_buffer_ref")?,
                 buffer_unref: symbol(libs, true, "av_buffer_unref")?,
                 parser_init: symbol(libs, false, "av_parser_init")?,
                 parser_parse2: symbol(libs, false, "av_parser_parse2")?,
                 parser_close: symbol(libs, false, "av_parser_close")?,
                 parameters_to_context: symbol(libs, false, "avcodec_parameters_to_context")?,
+                flush_buffers: symbol(libs, false, "avcodec_flush_buffers")?,
             })
         }
     }
@@ -1223,6 +1432,7 @@ mod codec {
         packet_alloc: PacketAlloc,
         packet_free: PacketFree,
         packet_unref: PacketUnref,
+        seek_frame: SeekFrame,
     }
 
     impl FormatSymbols {
@@ -1242,8 +1452,186 @@ mod codec {
                 packet_alloc: symbol(libs.codec_symbol("av_packet_alloc"))?,
                 packet_free: symbol(libs.codec_symbol("av_packet_free"))?,
                 packet_unref: symbol(libs.codec_symbol("av_packet_unref"))?,
+                seek_frame: symbol(libs.format_symbol("av_seek_frame"))?,
             })
         }
+    }
+
+    /// The libswscale functions the readback converts through, resolved only where `libswscale` of
+    /// the declared ABI is installed. Optional throughout: where it is not, the scalar converter
+    /// stands in, so a readback costs more, but works.
+    #[derive(Clone, Copy)]
+    struct SwsSymbols {
+        get_context: SwsGetContext,
+        set_colorspace_details: SwsSetColorspaceDetails,
+        get_coefficients: SwsGetCoefficients,
+        scale: SwsScale,
+        free_context: SwsFreeContext,
+    }
+
+    impl SwsSymbols {
+        fn resolve(libs: &Ffmpeg) -> Option<Self> {
+            // An escape hatch for the benchmark and for diagnosis: with `GPUI_VA_NO_SWSCALE` set, the
+            // scalar converter is used even where libswscale is installed, so the two can be compared
+            // on one machine.
+            if std::env::var_os("GPUI_VA_NO_SWSCALE").is_some() {
+                return None;
+            }
+            fn symbol<T>(address: Option<*mut c_void>) -> Option<T> {
+                let address = address?;
+                // SAFETY: `T` is a function-pointer type, the same size as the address.
+                Some(unsafe { std::mem::transmute_copy(&address) })
+            }
+
+            Some(Self {
+                get_context: symbol(libs.swscale_symbol("sws_getContext"))?,
+                set_colorspace_details: symbol(libs.swscale_symbol("sws_setColorspaceDetails"))?,
+                get_coefficients: symbol(libs.swscale_symbol("sws_getCoefficients"))?,
+                scale: symbol(libs.swscale_symbol("sws_scale"))?,
+                free_context: symbol(libs.swscale_symbol("sws_freeContext"))?,
+            })
+        }
+    }
+
+    /// The libswscale convert context for one source geometry and colour space, created on first use
+    /// and recreated when either changes. One context is reused across a stream's frames, which is
+    /// what keeps the conversion cheap; rebuilding it per frame would negate the accelerator.
+    struct Sws {
+        symbols: SwsSymbols,
+        context: *mut c_void,
+        width: usize,
+        height: usize,
+        color_space: gpui_engine::YuvColorSpace,
+    }
+
+    impl Sws {
+        fn new(symbols: SwsSymbols) -> Self {
+            Self {
+                symbols,
+                context: std::ptr::null_mut(),
+                width: 0,
+                height: 0,
+                color_space: gpui_engine::YuvColorSpace::default(),
+            }
+        }
+
+        /// The context for a `width`x`height` `NV12` frame in `color_space`, built if this is the
+        /// first call or either changed. `None` where libswscale refuses the geometry, so the caller
+        /// falls back to the scalar walk.
+        unsafe fn context_for(
+            &mut self,
+            width: usize,
+            height: usize,
+            color_space: gpui_engine::YuvColorSpace,
+        ) -> Option<*mut c_void> {
+            if !self.context.is_null()
+                && self.width == width
+                && self.height == height
+                && self.color_space == color_space
+            {
+                return Some(self.context);
+            }
+            if !self.context.is_null() {
+                (self.symbols.free_context)(self.context);
+                self.context = std::ptr::null_mut();
+            }
+            let context = (self.symbols.get_context)(
+                width as c_int,
+                height as c_int,
+                AV_PIX_FMT_NV12,
+                width as c_int,
+                height as c_int,
+                AV_PIX_FMT_BGRA,
+                SWS_BILINEAR,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            if context.is_null() {
+                return None;
+            }
+            // The stream's own matrix and range, so the convert matches a scalar walk with the same
+            // coefficients; the packed BGRA destination is full range.
+            let (matrix, src_range) = sws_colorspace(color_space);
+            let in_table = (self.symbols.get_coefficients)(matrix);
+            let out_table = (self.symbols.get_coefficients)(matrix);
+            (self.symbols.set_colorspace_details)(
+                context,
+                in_table,
+                src_range,
+                out_table,
+                1,
+                0,
+                1 << 16,
+                1 << 16,
+            );
+            self.context = context;
+            self.width = width;
+            self.height = height;
+            self.color_space = color_space;
+            Some(context)
+        }
+
+        /// Convert a `NV12` frame's planes into packed `BGRA8` at `out`, or `false` where libswscale
+        /// will not take the frame and the caller must fall back.
+        ///
+        /// SAFETY: the caller guarantees the planes cover `width`x`height` for the strides given, and
+        /// that `out` is at least `width * height * 4` bytes.
+        unsafe fn convert(
+            &mut self,
+            luma: *const u8,
+            luma_stride: c_int,
+            chroma: *const u8,
+            chroma_stride: c_int,
+            width: usize,
+            height: usize,
+            color_space: gpui_engine::YuvColorSpace,
+            out: *mut u8,
+        ) -> bool {
+            let Some(context) = self.context_for(width, height, color_space) else {
+                return false;
+            };
+            let src_data = [luma, chroma, std::ptr::null(), std::ptr::null()];
+            let src_stride = [luma_stride, chroma_stride, 0, 0];
+            let mut dst_data = [out, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()];
+            let dst_stride = [(width * 4) as c_int, 0, 0, 0];
+            (self.symbols.scale)(
+                context,
+                src_data.as_ptr(),
+                src_stride.as_ptr(),
+                0,
+                height as c_int,
+                dst_data.as_mut_ptr(),
+                dst_stride.as_ptr(),
+            ) >= 0
+        }
+    }
+
+    impl Drop for Sws {
+        fn drop(&mut self) {
+            if !self.context.is_null() {
+                // SAFETY: the context is one `sws_getContext` returned.
+                unsafe { (self.symbols.free_context)(self.context) };
+                self.context = std::ptr::null_mut();
+            }
+        }
+    }
+
+    /// The `SWS_CS_*` id and source-range flag for the engine's colour space, so `sws_scale` uses the
+    /// same matrix and range the scalar converter would.
+    fn sws_colorspace(color_space: gpui_engine::YuvColorSpace) -> (c_int, c_int) {
+        use gpui_engine::{YuvMatrix, YuvRange};
+
+        let matrix = match color_space.matrix {
+            YuvMatrix::Bt601 => SWS_CS_ITU601,
+            YuvMatrix::Bt709 => SWS_CS_ITU709,
+            YuvMatrix::Bt2020 => SWS_CS_BT2020,
+        };
+        let range = match color_space.range {
+            YuvRange::Limited => 0,
+            YuvRange::Full => 1,
+        };
+        (matrix, range)
     }
 
     /// A long-lived decode: the libavcodec context, the VA-API device under it, and the parser that
@@ -1364,6 +1752,29 @@ mod codec {
             Ok(decoder)
         }
 
+        /// Drop everything the decoder has buffered and queued, so it resumes from a new position
+        /// rather than emitting frames from the old one.
+        pub fn flush(&mut self) {
+            self.queue.clear();
+            // SAFETY: `context` is this decoder's open context.
+            unsafe { (self.symbols.flush_buffers)(self.context) };
+        }
+
+        /// The stream is starting over: flush the decoder, and reset the parser so the bytes fed again
+        /// are framed as a fresh stream rather than the tail of the old one. Reused across loops
+        /// instead of opening a new decoder, which would build a fresh VA-API device and surface pool
+        /// the driver does not hand back.
+        pub fn rewind(&mut self) {
+            self.flush();
+            if !self.parser.is_null() {
+                // SAFETY: the parser is this decoder's; closing and re-initing resets its state.
+                unsafe {
+                    (self.symbols.parser_close)(self.parser);
+                    self.parser = (self.symbols.parser_init)(AV_CODEC_ID_H264);
+                }
+            }
+        }
+
         /// Feed `chunk` of the elementary stream: its access units are parsed out and sent to the
         /// decoder, ready for [`Decoder::receive`].
         pub fn send(&mut self, chunk: &[u8]) -> anyhow::Result<()> {
@@ -1478,8 +1889,9 @@ mod codec {
                 unsafe { (self.symbols.frame_free)(&mut frame) };
                 return None;
             }
-            let (colorspace, color_range, height, format) = unsafe {
+            let (pts, colorspace, color_range, height, format) = unsafe {
                 (
+                    (*frame).pts,
                     (*frame).colorspace,
                     (*frame).color_range,
                     (*frame).height,
@@ -1508,6 +1920,7 @@ mod codec {
                     _libs: self.libs.clone(),
                     symbols: self.symbols,
                     frame,
+                    pts,
                     handle: handle.with_color_space(color_space),
                 }),
                 Err(error) => {
@@ -1540,6 +1953,8 @@ mod codec {
         _libs: Arc<Ffmpeg>,
         symbols: Symbols,
         frame: *mut AvFrame,
+        /// The frame's presentation timestamp, as the decoder read it from the bitstream.
+        pts: i64,
         handle: DmaBufHandle,
     }
 
@@ -1548,12 +1963,399 @@ mod codec {
         pub fn handle(&self) -> &DmaBufHandle {
             &self.handle
         }
+
+        /// When this frame is shown, in the stream's own time base, or `None` where the stream names no
+        /// timestamp. A player compares this against a seek target to decode forward to it; a raw
+        /// elementary stream, which the parser frames without timestamps, carries none.
+        pub fn pts(&self) -> Option<i64> {
+            (self.pts != AV_NOPTS_VALUE).then_some(self.pts)
+        }
+
+        /// Read this frame back to the CPU as packed `BGRA8` — what a player that cannot import the
+        /// surface as a texture does instead: copy the decoded pixels out of the driver's buffer and
+        /// convert them in software.
+        ///
+        /// The hardware frame is transferred into a software `NV12` frame first, a GPU→CPU copy that is
+        /// exactly the cost zero-copy avoids, and the conversion then walks both planes with the
+        /// stream's own matrix and range. The result is `width * height * 4` bytes.
+        pub fn to_bgra(&self) -> Option<CpuFrame> {
+            self.to_bgra_timed().map(|(frame, _, _)| frame)
+        }
+
+        /// [`to_bgra`](Self::to_bgra), reporting how long the GPU→CPU transfer and the software
+        /// conversion each took, so a caller can see which dominates.
+        pub fn to_bgra_timed(&self) -> Option<(CpuFrame, Duration, Duration)> {
+            let symbols = self.symbols;
+            // SAFETY: the software frame is allocated here and freed before returning; the hardware
+            // frame is this frame's own and alive across the call.
+            unsafe {
+                let mut software = (symbols.frame_alloc)();
+                if software.is_null() {
+                    return None;
+                }
+                (*software).format = AV_PIX_FMT_NV12;
+                let transfer_start = Instant::now();
+                let transferred = (symbols.hwframe_transfer_data)(software, self.frame, 0) >= 0;
+                let transfer = transfer_start.elapsed();
+                if !transferred {
+                    (symbols.frame_free)(&mut software);
+                    return None;
+                }
+                let width = (*software).width.max(0) as usize;
+                let height = (*software).height.max(0) as usize;
+                let luma = (*software).data[0];
+                let chroma = (*software).data[1];
+                let luma_stride = (*software).linesize[0];
+                let chroma_stride = (*software).linesize[1];
+                let color_space = self.handle.color_space;
+                let mut bgra = vec![0u8; width * height * 4];
+                // A context of this call's own: `to_bgra` builds a frame per call, so there is no
+                // scratch to cache one in; the readback that reuses frames is `Frame::readback`.
+                let mut sws = SwsSymbols::resolve(&self._libs).map(Sws::new);
+                let convert_start = Instant::now();
+                if width > 0 && height > 0 && !luma.is_null() && !chroma.is_null() {
+                    convert_nv12_to_bgra(
+                        luma,
+                        luma_stride,
+                        chroma,
+                        chroma_stride,
+                        width,
+                        height,
+                        color_space,
+                        &mut bgra,
+                        sws.as_mut(),
+                    );
+                }
+                let convert = convert_start.elapsed();
+                (symbols.frame_free)(&mut software);
+                Some((
+                    CpuFrame {
+                        width: width as u32,
+                        height: height as u32,
+                        bgra,
+                    },
+                    transfer,
+                    convert,
+                ))
+            }
+        }
+    }
+
+    /// A decoded frame read back to the CPU, packed as `BGRA8` — the shape a player has when it presents
+    /// through an uploaded texture rather than a dma-buf the renderer imports.
+    pub struct CpuFrame {
+        pub width: u32,
+        pub height: u32,
+        /// `width * height * 4` bytes, `BGRA` per pixel.
+        pub bgra: Vec<u8>,
+    }
+
+    /// Convert a software `NV12` frame to packed `BGRA8`, using the stream's own matrix and range.
+    ///
+    /// `NV12` is one luma plane at full size and one interleaved chroma plane at half size in both
+    /// dimensions; the two chroma samples a pixel needs are shared by a 2x2 block, so the plane is
+    /// walked at half the row rate. Scalar, and the fallback for a machine without libswscale, which
+    /// [`Sws`] accelerates through and which the parity test below holds this to.
+    fn nv12_to_bgra(
+        luma: *const u8,
+        luma_stride: c_int,
+        chroma: *const u8,
+        chroma_stride: c_int,
+        width: usize,
+        height: usize,
+        color_space: gpui_engine::YuvColorSpace,
+        out: &mut [u8],
+    ) {
+        use gpui_engine::{YuvMatrix, YuvRange};
+
+        // The luma/chroma weights; green follows from the other two.
+        let (kr, kb) = match color_space.matrix {
+            YuvMatrix::Bt601 => (0.2990f32, 0.1140f32),
+            YuvMatrix::Bt709 => (0.2126, 0.0722),
+            YuvMatrix::Bt2020 => (0.2627, 0.0593),
+        };
+        let kg = 1.0 - kr - kb;
+        let (y_scale, y_offset, c_scale) = match color_space.range {
+            YuvRange::Limited => (255.0 / 219.0, 16.0, 255.0 / 224.0),
+            YuvRange::Full => (1.0, 0.0, 1.0),
+        };
+        // The matrix and range folded into 16.16 fixed-point coefficients once, so the inner loop is
+        // integer arithmetic — several times cheaper than a float per channel per pixel.
+        let fix = |v: f32| (v * 65536.0).round() as i32;
+        let yc = fix(y_scale);
+        let yo = fix(y_offset * y_scale);
+        let r_v = fix(2.0 * (1.0 - kr) * c_scale);
+        let b_u = fix(2.0 * (1.0 - kb) * c_scale);
+        let g_u = fix(2.0 * kb * (1.0 - kb) / kg * c_scale);
+        let g_v = fix(2.0 * kr * (1.0 - kr) / kg * c_scale);
+
+        for row in 0..height {
+            // SAFETY: the caller guarantees the planes cover the frame for the strides given; a luma
+            // row is `width` bytes and a chroma row is `width` bytes of interleaved U/V.
+            let (luma_row, chroma_row) = unsafe {
+                (
+                    std::slice::from_raw_parts(luma.add(row * luma_stride as usize), width),
+                    std::slice::from_raw_parts(chroma.add((row / 2) * chroma_stride as usize), width),
+                )
+            };
+            let out_row = &mut out[row * width * 4..(row + 1) * width * 4];
+            for (col, pixel) in out_row.chunks_exact_mut(4).enumerate() {
+                let y = (i32::from(luma_row[col]) * yc - yo) >> 16;
+                let u = i32::from(chroma_row[col & !1]) - 128;
+                let v = i32::from(chroma_row[(col & !1) + 1]) - 128;
+                pixel[0] = clamp8(y + ((b_u * u) >> 16));
+                pixel[1] = clamp8(y - ((g_u * u + g_v * v) >> 16));
+                pixel[2] = clamp8(y + ((r_v * v) >> 16));
+                pixel[3] = 255;
+            }
+        }
+    }
+
+    /// Clamp a channel to a byte.
+    fn clamp8(value: i32) -> u8 {
+        value.clamp(0, 255) as u8
+    }
+
+    /// Convert an `NV12` frame's planes into packed `BGRA8` in `out`, through `sws_scale` where a
+    /// libswscale context is given and libswscale accepts the frame, and the scalar walk otherwise.
+    ///
+    /// SAFETY: the caller guarantees the planes cover `width`x`height` for the strides given, and
+    /// that `out` is at least `width * height * 4` bytes.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn convert_nv12_to_bgra(
+        luma: *const u8,
+        luma_stride: c_int,
+        chroma: *const u8,
+        chroma_stride: c_int,
+        width: usize,
+        height: usize,
+        color_space: gpui_engine::YuvColorSpace,
+        out: &mut [u8],
+        sws: Option<&mut Sws>,
+    ) {
+        if let Some(sws) = sws {
+            if sws.convert(
+                luma,
+                luma_stride,
+                chroma,
+                chroma_stride,
+                width,
+                height,
+                color_space,
+                out.as_mut_ptr(),
+            ) {
+                return;
+            }
+        }
+        nv12_to_bgra(
+            luma,
+            luma_stride,
+            chroma,
+            chroma_stride,
+            width,
+            height,
+            color_space,
+            out,
+        );
     }
 
     impl Drop for Frame {
         fn drop(&mut self) {
             // SAFETY: the frame is one this decoder allocated; the free returns its surface to the pool.
             unsafe { (self.symbols.frame_free)(&mut self.frame) };
+        }
+    }
+
+    /// A reusable readback: the software frame a hardware frame is transferred into, and the packed
+    /// output buffer, kept across frames so a readback reuses memory instead of allocating and
+    /// first-touching fresh pages every call.
+    pub struct Readback {
+        symbols: Symbols,
+        software: *mut AvFrame,
+        bgra: Vec<u8>,
+        /// The libswscale convert, `None` where it is not installed, in which case the scalar walk
+        /// stands in. Kept across reads so its context is built once per stream geometry.
+        sws: Option<Sws>,
+    }
+
+    /// One readback's result, borrowing the scratch's buffer until the next [`Readback::read`].
+    pub struct ReadbackFrame<'a> {
+        pub width: u32,
+        pub height: u32,
+        /// `width * height * 4` bytes, `BGRA` per pixel.
+        pub bgra: &'a [u8],
+        /// How long the GPU→CPU transfer took.
+        pub transfer: Duration,
+        /// How long the software conversion took.
+        pub convert: Duration,
+    }
+
+    impl Frame {
+        /// A readback scratch that reuses its buffers, for reading frames of this stream back to the
+        /// CPU repeatedly.
+        pub fn readback(&self) -> Option<Readback> {
+            let symbols = self.symbols;
+            let sws = SwsSymbols::resolve(&self._libs).map(Sws::new);
+            // SAFETY: allocates a software frame, freed in `Readback::drop`.
+            let software = unsafe { (symbols.frame_alloc)() };
+            if software.is_null() {
+                return None;
+            }
+            // The transfer fills this frame in the format it names, reused on every later read.
+            unsafe { (*software).format = AV_PIX_FMT_NV12 };
+            Some(Readback {
+                symbols,
+                software,
+                bgra: Vec::new(),
+                sws,
+            })
+        }
+    }
+
+    impl Readback {
+        /// Transfer `frame` to the CPU and convert it into this scratch's buffers, reusing them.
+        pub fn read(&mut self, frame: &Frame) -> Option<ReadbackFrame<'_>> {
+            let symbols = self.symbols;
+            // SAFETY: the software frame is this scratch's and alive; `frame`'s hardware frame is
+            // alive for the borrow.
+            unsafe {
+                let transfer_start = Instant::now();
+                let transferred = (symbols.hwframe_transfer_data)(self.software, frame.frame, 0) >= 0;
+                let transfer = transfer_start.elapsed();
+                if !transferred {
+                    return None;
+                }
+                let width = (*self.software).width.max(0) as usize;
+                let height = (*self.software).height.max(0) as usize;
+                let luma = (*self.software).data[0];
+                let chroma = (*self.software).data[1];
+                let luma_stride = (*self.software).linesize[0];
+                let chroma_stride = (*self.software).linesize[1];
+                let len = width * height * 4;
+                if self.bgra.len() != len {
+                    // Only the first read sizes it; later reads reuse the same pages, so the
+                    // conversion writes memory that is already resident.
+                    self.bgra.resize(len, 0);
+                }
+                let convert_start = Instant::now();
+                if width > 0 && height > 0 && !luma.is_null() && !chroma.is_null() {
+                    convert_nv12_to_bgra(
+                        luma,
+                        luma_stride,
+                        chroma,
+                        chroma_stride,
+                        width,
+                        height,
+                        frame.handle.color_space,
+                        &mut self.bgra,
+                        self.sws.as_mut(),
+                    );
+                }
+                let convert = convert_start.elapsed();
+                Some(ReadbackFrame {
+                    width: width as u32,
+                    height: height as u32,
+                    bgra: &self.bgra,
+                    transfer,
+                    convert,
+                })
+            }
+        }
+    }
+
+    impl Drop for Readback {
+        fn drop(&mut self) {
+            // SAFETY: the software frame is one this scratch allocated.
+            unsafe { (self.symbols.frame_free)(&mut self.software) };
+        }
+    }
+
+    /// A staged readback's result: the transfer, the copy into the staging buffer, and the conversion
+    /// from it, each timed.
+    pub struct StagedReadback<'a> {
+        pub width: u32,
+        pub height: u32,
+        pub bgra: &'a [u8],
+        pub transfer: Duration,
+        pub copy: Duration,
+        pub convert: Duration,
+    }
+
+    impl Readback {
+        /// Like [`read`](Self::read), but first copying the transferred planes into `staging` (tightly
+        /// packed, so a caller can pool it) and converting from there — a test of whether the
+        /// transferred buffer itself is slow to read. The source is read once for the copy; the
+        /// conversion then reads cached memory.
+        pub fn read_staged(
+            &mut self,
+            frame: &Frame,
+            staging: &mut Vec<u8>,
+        ) -> Option<StagedReadback<'_>> {
+            let symbols = self.symbols;
+            // SAFETY: the software frame is this scratch's and alive; `frame`'s hardware frame is
+            // alive for the borrow; the staging offsets are within the resized buffer.
+            unsafe {
+                let transfer_start = Instant::now();
+                let transferred = (symbols.hwframe_transfer_data)(self.software, frame.frame, 0) >= 0;
+                let transfer = transfer_start.elapsed();
+                if !transferred {
+                    return None;
+                }
+                let width = (*self.software).width.max(0) as usize;
+                let height = (*self.software).height.max(0) as usize;
+                let luma = (*self.software).data[0];
+                let chroma = (*self.software).data[1];
+                let luma_stride = (*self.software).linesize[0] as usize;
+                let chroma_stride = (*self.software).linesize[1] as usize;
+                let luma_len = width * height;
+                let chroma_len = luma_len / 2;
+
+                let copy_start = Instant::now();
+                staging.clear();
+                staging.resize(luma_len + chroma_len, 0);
+                if !luma.is_null() && width > 0 {
+                    for row in 0..height {
+                        let src = std::slice::from_raw_parts(luma.add(row * luma_stride), width);
+                        staging[row * width..row * width + width].copy_from_slice(src);
+                    }
+                }
+                if !chroma.is_null() && width > 0 {
+                    for row in 0..height / 2 {
+                        let src = std::slice::from_raw_parts(chroma.add(row * chroma_stride), width);
+                        let at = luma_len + row * width;
+                        staging[at..at + width].copy_from_slice(src);
+                    }
+                }
+                let copy = copy_start.elapsed();
+
+                let len = width * height * 4;
+                if self.bgra.len() != len {
+                    self.bgra.resize(len, 0);
+                }
+                let convert_start = Instant::now();
+                if width > 0 && height > 0 {
+                    convert_nv12_to_bgra(
+                        staging.as_ptr(),
+                        width as c_int,
+                        staging.as_ptr().add(luma_len),
+                        width as c_int,
+                        width,
+                        height,
+                        frame.handle.color_space,
+                        &mut self.bgra,
+                        self.sws.as_mut(),
+                    );
+                }
+                let convert = convert_start.elapsed();
+                Some(StagedReadback {
+                    width: width as u32,
+                    height: height as u32,
+                    bgra: &self.bgra,
+                    transfer,
+                    copy,
+                    convert,
+                })
+            }
         }
     }
 
@@ -1572,8 +2374,12 @@ mod codec {
         packet: *mut AvPacket,
         /// The video stream's codec parameters, valid for as long as `format` is open.
         parameters: *mut c_void,
+        /// The video stream's index in the container, so a seek targets that stream's time base.
+        index: c_int,
         /// The stream's average frame rate, for pacing playback.
         frame_rate: AvRational,
+        /// The stream's time base, so a seek target can be expressed in the units a frame's `pts` is in.
+        time_base: AvRational,
     }
 
     impl Demuxer {
@@ -1609,7 +2415,9 @@ mod codec {
                 format,
                 packet: ptr::null_mut(),
                 parameters: ptr::null_mut(),
+                index: -1,
                 frame_rate: AvRational { num: 0, den: 0 },
+                time_base: AvRational { num: 0, den: 0 },
             };
             // From here any `?` drops `demuxer`, closing the format.
             anyhow::ensure!(
@@ -1633,7 +2441,9 @@ mod codec {
             let stream = &**context.streams.add(index as usize);
             anyhow::ensure!(!stream.codecpar.is_null(), "the video stream has no parameters");
             demuxer.parameters = stream.codecpar;
+            demuxer.index = index;
             demuxer.frame_rate = stream.avg_frame_rate;
+            demuxer.time_base = stream.time_base;
             demuxer.packet = (demuxer.symbols.packet_alloc)();
             anyhow::ensure!(!demuxer.packet.is_null(), "av_packet_alloc failed");
             Ok(demuxer)
@@ -1644,18 +2454,26 @@ mod codec {
             Decoder::open_demuxed(self.libs.clone(), self.parameters)
         }
 
-        /// Read the next packet and hand it to `decoder` — a container frames its packets already, so
-        /// they go in ahead of any parser. `Ok(false)` at the end of the stream; an error only where
-        /// the decoder refused a packet.
+        /// Read the next video packet and hand it to `decoder` — a container frames its packets
+        /// already, so they go in ahead of any parser. Packets from the container's other streams
+        /// (audio, subtitles) are skipped: a container interleaves them, and only the video feeds the
+        /// decoder. `Ok(false)` at the end of the stream; an error only where the decoder refused a
+        /// packet.
         pub fn send_next(&mut self, decoder: &mut Decoder) -> anyhow::Result<bool> {
-            // SAFETY: the packet is one this demuxer allocated; releasing it before re-reading keeps
-            // the next read from overwriting a buffer still in use, and it accepts a released packet.
-            unsafe { (self.symbols.packet_unref)(self.packet) };
-            if unsafe { (self.symbols.read_frame)(self.format, self.packet) } < 0 {
-                return Ok(false);
+            loop {
+                // SAFETY: the packet is one this demuxer allocated; releasing it before re-reading
+                // keeps the next read from overwriting a buffer still in use, and it accepts a
+                // released packet.
+                unsafe { (self.symbols.packet_unref)(self.packet) };
+                if unsafe { (self.symbols.read_frame)(self.format, self.packet) } < 0 {
+                    return Ok(false);
+                }
+                if unsafe { (*self.packet).stream_index } == self.index {
+                    decoder.send_packet(self.packet)?;
+                    return Ok(true);
+                }
+                // Another stream's packet: read on until the video's arrives (or the stream ends).
             }
-            decoder.send_packet(self.packet)?;
-            Ok(true)
         }
 
         /// The stream's average frame period, where the container declares one, so a player can pace
@@ -1663,6 +2481,47 @@ mod codec {
         pub fn frame_period(&self) -> Option<Duration> {
             let (num, den) = (self.frame_rate.num, self.frame_rate.den);
             (num > 0 && den > 0).then(|| Duration::from_secs_f64(f64::from(den) / f64::from(num)))
+        }
+
+        /// How long the container is, where it declares a duration, so a player can show progress.
+        pub fn duration(&self) -> Option<Duration> {
+            // SAFETY: `format` is this demuxer's open context, and `duration` is read at the offset
+            // the declared ABI is asserted against.
+            let duration = unsafe { (&*self.format).duration };
+            (duration > 0).then(|| Duration::from_micros(duration as u64))
+        }
+
+        /// Convert a playback position — an offset from the stream's start — into the timestamp the
+        /// stream's frames are measured in, so a seek target can be compared against a frame's `pts`.
+        ///
+        /// This is the inverse of what libavformat does when [`seek`](Self::seek) is given a
+        /// timestamp in `AV_TIME_BASE` units with a `-1` stream index, so the target it produces is in
+        /// the same units as the `pts` the decoder then reports.
+        pub fn timestamp_at(&self, at: Duration) -> i64 {
+            let (num, den) = (self.time_base.num as i128, self.time_base.den as i128);
+            if num <= 0 || den <= 0 {
+                return AV_NOPTS_VALUE;
+            }
+            // `pts = at * den / (num * 1e6)`; the `i128` keeps a long stream's product from wrapping.
+            let micros = at.as_micros() as i128;
+            (micros * den / (num * 1_000_000)).clamp(i64::MIN as i128, i64::MAX as i128) as i64
+        }
+
+        /// Move the read position to the keyframe at or before `to`, returning the target in the
+        /// stream's own time base — the value a later frame's `pts` is compared against to decode
+        /// forward to it — or `None` where the source cannot seek. The decoder must be flushed before
+        /// it is fed again: a seek invalidates everything it has buffered.
+        pub fn seek(&mut self, to: Duration) -> Option<i64> {
+            let timestamp = self.timestamp_at(to);
+            if timestamp == AV_NOPTS_VALUE {
+                return None;
+            }
+            // SAFETY: `format` is this demuxer's open context; the timestamp is in the video stream's
+            // own time base, the one its frames report, so both name the same instant.
+            let seeked = unsafe {
+                (self.symbols.seek_frame)(self.format, self.index, timestamp, AVSEEK_FLAG_BACKWARD)
+            };
+            (seeked >= 0).then_some(timestamp)
         }
     }
 
@@ -1713,6 +2572,76 @@ mod codec {
             // `AVCOL_SPC_UNSPECIFIED`, `AVCOL_RANGE_UNSPECIFIED`.
             assert_eq!(color_space(2, 0, 576), YuvColorSpace::BT601_LIMITED);
             assert_eq!(color_space(2, 0, 1080), YuvColorSpace::BT709_LIMITED);
+        }
+
+        /// The libswscale convert, where installed, agrees with the scalar walk it stands in for —
+        /// the same matrix and range, to within a rounding step. A swapped matrix or range would
+        /// diverge by tens of levels, so a small tolerance still catches a real divergence.
+        #[test]
+        fn swscale_and_the_scalar_walk_agree() {
+            use std::ffi::c_int;
+
+            use super::super::ffmpeg;
+            use super::{nv12_to_bgra, Sws, SwsSymbols};
+
+            let Some(libs) = ffmpeg::load() else {
+                eprintln!("skipping: libavcodec/libavutil of the declared ABI is unavailable");
+                return;
+            };
+            let Some(symbols) = SwsSymbols::resolve(&libs) else {
+                eprintln!("skipping: libswscale of the declared ABI is unavailable");
+                return;
+            };
+
+            // A synthetic NV12 frame: a luma ramp, and chroma off neutral so both the U and V
+            // coefficients are exercised.
+            let (width, height) = (16usize, 8usize);
+            let mut nv12 = vec![0u8; width * height + width * height / 2];
+            for (i, y) in nv12[..width * height].iter_mut().enumerate() {
+                *y = ((i * 7) % 256) as u8;
+            }
+            let (luma, chroma) = nv12.split_at_mut(width * height);
+            for (i, c) in chroma.iter_mut().enumerate() {
+                *c = if i % 2 == 0 { 135 } else { 72 };
+            }
+
+            for color_space in [YuvColorSpace::BT601_LIMITED, YuvColorSpace::BT709_LIMITED] {
+                let mut expected = vec![0u8; width * height * 4];
+                nv12_to_bgra(
+                    luma.as_ptr(),
+                    width as c_int,
+                    chroma.as_ptr(),
+                    width as c_int,
+                    width,
+                    height,
+                    color_space,
+                    &mut expected,
+                );
+
+                let mut got = vec![0u8; width * height * 4];
+                let mut sws = Sws::new(symbols);
+                // SAFETY: the planes cover the frame for the strides given, and `got` is sized.
+                let converted = unsafe {
+                    sws.convert(
+                        luma.as_ptr(),
+                        width as c_int,
+                        chroma.as_ptr(),
+                        width as c_int,
+                        width,
+                        height,
+                        color_space,
+                        got.as_mut_ptr(),
+                    )
+                };
+                assert!(converted, "libswscale refused the frame");
+
+                for (i, (a, b)) in expected.iter().zip(&got).enumerate() {
+                    assert!(
+                        a.abs_diff(*b) <= 2,
+                        "channel {i} differs by more than a rounding step: {a} vs {b}"
+                    );
+                }
+            }
         }
     }
 }
@@ -2192,5 +3121,45 @@ mod tests {
             "the playback looped past the clip's 60 frames, at {}",
             playback.position()
         );
+    }
+
+    /// A seek lands on the frame *at* the target, not the keyframe before it. A container seeks to
+    /// the keyframe at or before the target, so the frames between are decoded forward and dropped
+    /// until the target is reached — which is what makes a scrub land where it was dragged to on a
+    /// stream whose keyframes are sparse. The clip's keyframes fall on even frames, so an odd frame is
+    /// one the decoder can only reach by decoding forward from the keyframe before it.
+    #[test]
+    fn a_seek_decodes_forward_to_the_frame_at_the_target() {
+        let Some(probe) = Demuxer::open(Path::new(FIXTURE_MP4)) else {
+            eprintln!("skipping: libavformat of the declared ABI is unavailable");
+            return;
+        };
+        let Some(mut playback) = Playback::open_path(Path::new(FIXTURE_MP4), 3) else {
+            eprintln!(
+                "skipping: libavformat/libavcodec of the declared ABI, or the VA-API device, is \
+                 unavailable"
+            );
+            return;
+        };
+        let period = playback.frame_period().expect("the clip declares a frame rate");
+        let period_ts = probe.timestamp_at(period);
+
+        for frame in [1u32, 7, 13, 21, 31, 45] {
+            let target = period * frame;
+            let target_ts = probe.timestamp_at(target);
+            assert!(playback.seek(target), "seek to {target:?}");
+            let handle = playback.next().expect("a frame after the seek");
+            let pts = playback
+                .live
+                .back()
+                .and_then(|live| live._frame.pts())
+                .expect("the frame shown carries a timestamp");
+            // Release the frame, as the renderer does, so `live` never fills to `depth`.
+            signal(&handle);
+            assert!(
+                pts >= target_ts && pts < target_ts + period_ts,
+                "seeking to frame {frame} shows it, not the keyframe before: pts {pts}, target {target_ts}"
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! The producer side of the surface path.
+//! The platform seam for video: what a backend implements so a video reaches the surface path.
 //!
 //! `gpui_engine` owns the consumer's half: [`SurfaceSource`], the payload a renderer samples, and
 //! `SurfaceFormat`, the shape it is read as. This crate owns the half that feeds it — what something
@@ -8,7 +8,8 @@
 //!
 //! It is deliberately the **surface** seam and not a video one. A video producer adds a *cadence* (a
 //! frame every period) and a *pool* (recycle a surface only once the renderer released it); a 3D
-//! producer adds neither. What they share, and all this seam carries, is a surface.
+//! producer adds neither. What they share, and all this seam carries, is a surface. It is named for
+//! what implements it — `gpui_va`, `gpui_cv`, `gpui_mf` — not because a surface is only a video's.
 
 use gpui_engine::SurfaceSource;
 

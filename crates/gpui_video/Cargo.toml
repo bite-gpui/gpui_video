@@ -17,5 +17,22 @@ doctest = false
 # it, `gpui_engine`'s `SurfaceSource`. Not the facade: an element depends on the authoring crate, the
 # way `gpui_authoring`'s own elements do.
 gpui_authoring.workspace = true
-# The producer seam. This is the only thing the element knows about what feeds it.
-gpui_surface_producer.workspace = true
+# The platform seam. This is the only thing the element knows about what feeds it.
+gpui_video_platform.workspace = true
+# The bus between the UI thread and the service thread that owns the pipeline: commands out, decoded
+# frames back. Only `Send` values cross, so the pipeline itself never has to be `Send`.
+flume.workspace = true
+
+# `gpui_video` is the facade over the platform producers, so it may name them: the source shape opens
+# a file itself and needs the platform's decoder to do it. Each backend is Linux/macOS/Windows-scoped,
+# so only the one that exists for a target is a dependency.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpui_va.workspace = true
+
+[dev-dependencies]
+# The examples open a real window, so they need the facade with a platform backend — `gpui` is
+# downstream of this crate's elements, and only an example needs it.
+gpui = { workspace = true, features = ["platform"] }
+# The grid example builds a `RenderImage` from a read-back frame, so it names the image buffer type.
+image.workspace = true
+smallvec.workspace = true
