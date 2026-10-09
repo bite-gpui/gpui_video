@@ -17,6 +17,9 @@ doctest = false
 [target.'cfg(target_os = "linux")'.dependencies]
 anyhow.workspace = true
 gpui_engine.workspace = true
+# The producer seam the surface path is fed through, so a Linux playback and a macOS decoder reach
+# the same element. `gpui_surface_producer` depends only on the engine.
+gpui_surface_producer.workspace = true
 log.workspace = true
 # `dlopen` `libva`, so a machine without the driver compiles and skips rather than failing to link.
 libloading = "0.8"

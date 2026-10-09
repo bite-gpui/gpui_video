@@ -106,6 +106,13 @@ pub fn decode(bitstream: &[u8]) -> Option<Frame> {
 
 pub use codec::{Decoder, Demuxer, Frame};
 
+/// The producer seam: a playback hands the surface path each decoded frame as its period comes due.
+impl gpui_surface_producer::SurfaceProducer for Playback {
+    fn surface(&mut self) -> Option<gpui_engine::SurfaceSource> {
+        self.next().map(Into::into)
+    }
+}
+
 /// A bounded playback over a stream: it decodes a few frames ahead, hands one out at a time, and
 /// recycles a surface only once the consumer says it has finished with it.
 ///
