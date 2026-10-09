@@ -62,6 +62,9 @@ const WINDOW_W: f32 = 1280.0;
 const WINDOW_H: f32 = 800.0;
 /// A pane's assumed period until its stream declares its own.
 const DEFAULT_PERIOD: Duration = Duration::from_millis(40);
+/// How long a pane waits for a frame it asked for before giving up on the reply. Well above any real
+/// frame's latency, so it only fires for a request whose answer is never coming.
+const ADVANCE_TIMEOUT: Duration = Duration::from_millis(500);
 /// The most panes that may present in one render unless `GPUI_GRID_BUDGET` overrides it. Bounding the
 /// per-render work keeps a wall of hundreds responsive: the UI thread lays the grid out and uploads
 /// the frames that changed, so with no cap every pane changes every frame as soon as the workers can
@@ -100,6 +103,9 @@ enum ToUi {
     Opened(Duration),
     /// A frame to present.
     Frame(Content),
+    /// This turn produced no frame — the source had none ready. It answers the request anyway, so a
+    /// pane is never left believing a frame is in flight that will never come.
+    Idle,
 }
 
 /// What the UI asks a pane's worker for.
@@ -121,6 +127,8 @@ struct Pane {
     /// Whether a frame is in flight, so a pane takes at most one at a time — a zero-copy pane that
     /// took two frames and showed one would never release the one it dropped.
     pending: bool,
+    /// When the in-flight request was sent, so a reply that never comes can be given up on.
+    pending_since: Option<Instant>,
     due: Instant,
     period: Duration,
 }
@@ -130,13 +138,26 @@ impl Pane {
     /// spend a per-render budget of asks.
     fn tick(&mut self) -> bool {
         let now = Instant::now();
-        if self.pending || now < self.due {
+        if self.pending {
+            // A reply that never arrives — a worker that died, a message lost across a mode switch —
+            // would freeze the pane for good. After long enough, give up and ask again.
+            if !self
+                .pending_since
+                .is_some_and(|at| now.duration_since(at) >= ADVANCE_TIMEOUT)
+            {
+                return false;
+            }
+            self.pending = false;
+            self.pending_since = None;
+        }
+        if now < self.due {
             return false;
         }
         if self.worker.send(ToWorker::Advance).is_err() {
             return false;
         }
         self.pending = true;
+        self.pending_since = Some(now);
         // Move the deadline on by a period, so the pane keeps its stream's rate across render ticks.
         self.due += self.period;
         if now.duration_since(self.due) >= self.period {
@@ -163,6 +184,9 @@ impl Metrics {
 
 struct Grid {
     panes: Vec<Pane>,
+    /// Bumped whenever the panes are rebuilt, so a reply from a superseded pane's worker is ignored
+    /// rather than delivered to the pane that reused its index.
+    generation: u64,
     sources: Vec<PathBuf>,
     cols: usize,
     rows: usize,
@@ -232,6 +256,7 @@ impl Grid {
     ) -> Self {
         let mut grid = Self {
             panes: Vec::new(),
+            generation: 0,
             sources,
             cols,
             rows,
@@ -274,6 +299,8 @@ impl Grid {
             .collect();
         self.replaced.extend(abandoned);
         self.panes.clear();
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         self.metrics = Arc::new(Metrics::default());
         self.snapshot = (0, 0, Instant::now());
         self.phases_snapshot = (*self.phases.borrow(), Instant::now());
@@ -302,7 +329,7 @@ impl Grid {
                 while let Ok(event) = from_worker.recv_async().await {
                     if this
                         .update(cx, |grid, cx| {
-                            grid.on_event(index, event);
+                            grid.on_event(generation, index, event);
                             cx.notify();
                         })
                         .is_err()
@@ -318,13 +345,20 @@ impl Grid {
                 worker: to_worker,
                 content: None,
                 pending: false,
+                pending_since: None,
                 due: Instant::now(),
                 period: DEFAULT_PERIOD,
             });
         }
     }
 
-    fn on_event(&mut self, index: usize, event: ToUi) {
+    fn on_event(&mut self, generation: u64, index: usize, event: ToUi) {
+        // A reply from a superseded pane would otherwise land on the pane that reused its index,
+        // replacing a frame that was just handed out — and so never painted — which strands the new
+        // playback's ring: the frame it displaced never signals its release.
+        if generation != self.generation {
+            return;
+        }
         let mut replaced = None;
         {
             let Some(pane) = self.panes.get_mut(index) else {
@@ -339,6 +373,11 @@ impl Grid {
                         replaced = Some(previous);
                     }
                     pane.pending = false;
+                    pane.pending_since = None;
+                }
+                ToUi::Idle => {
+                    pane.pending = false;
+                    pane.pending_since = None;
                 }
             }
         }
@@ -623,10 +662,19 @@ fn surface_worker(
     let _ = to_ui.send(ToUi::Opened(playback.frame_period().unwrap_or(DEFAULT_PERIOD)));
     while let Ok(ToWorker::Advance) = requests.recv() {
         let start = Instant::now();
-        if let Some(source) = playback.surface() {
-            metrics.record(start.elapsed());
-            if to_ui.send(ToUi::Frame(Content::Surface(source))).is_err() {
-                break;
+        match playback.surface() {
+            Some(source) => {
+                metrics.record(start.elapsed());
+                if to_ui.send(ToUi::Frame(Content::Surface(source))).is_err() {
+                    break;
+                }
+            }
+            // No frame ready this turn: answer the request anyway, so the pane is never left waiting
+            // on a frame that will not come.
+            None => {
+                if to_ui.send(ToUi::Idle).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -708,6 +756,9 @@ fn readback_worker(
             }
         };
         let Some(frame) = frame else {
+            if to_ui.send(ToUi::Idle).is_err() {
+                break;
+            }
             continue;
         };
         // Take a permit around the readback, so it runs no more than the pool allows even when every
@@ -721,6 +772,9 @@ fn readback_worker(
         metrics.record(start.elapsed());
         let _ = permits.send(());
         let Some(read) = read else {
+            if to_ui.send(ToUi::Idle).is_err() {
+                break;
+            }
             continue;
         };
         // The image owns its pixels, so the scratch's buffer is copied into it.

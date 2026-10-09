@@ -28,7 +28,7 @@ use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui_engine::DmaBufHandle;
 
@@ -171,6 +171,8 @@ enum Source {
 struct Live {
     _frame: Frame,
     release: Arc<OwnedFd>,
+    /// When the frame was handed out, so a release that never comes can be reclaimed.
+    handed: Instant,
 }
 
 /// How much of the stream is fed to the decoder at a time. Small, so one feed decodes only a frame or
@@ -179,6 +181,13 @@ const FEED_CHUNK: usize = 512;
 
 /// The fewest frames a playback may keep alive: one on screen, one to hand out next.
 const MIN_DEPTH: usize = 2;
+
+/// How long a handed-out frame waits for its release signal before the playback reclaims it anyway.
+///
+/// A consumer that never samples a frame — one handed out and then dropped before it reached the
+/// screen — never signals it, and the ring would otherwise wait on it for good, freezing that
+/// playback. Comfortably longer than any frame's screen life, so a live frame is never reclaimed.
+const RELEASE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How many packets one fill may decode while seeking forward to a target from the keyframe before it.
 /// A seek can cross a whole GOP, so the work is bounded by the file rather than by the queue depth.
@@ -318,6 +327,7 @@ impl Playback {
                 self.live.push_back(Live {
                     _frame: frame,
                     release,
+                    handed: Instant::now(),
                 });
                 self.current = Some(handle.clone());
                 self.position += 1;
@@ -351,11 +361,13 @@ impl Playback {
     /// any time, so its surface must not go back to the pool.
     fn recycle(&mut self) {
         while self.live.len() > 1 {
-            let signalled = self
-                .live
-                .front()
-                .is_some_and(|live| release_signalled(&live.release));
-            if !signalled {
+            let front = self.live.front().expect("live.len() > 1");
+            // Reclaim a frame the consumer released, or one it never released at all: a frame that
+            // was handed out and then dropped before it reached the screen signals nothing, and the
+            // ring must not wait on it for good.
+            let recyclable = release_signalled(&front.release)
+                || front.handed.elapsed() >= RELEASE_TIMEOUT;
+            if !recyclable {
                 break;
             }
             self.live.pop_front();
