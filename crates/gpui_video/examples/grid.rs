@@ -24,6 +24,12 @@
 //! that will not settle. `GPUI_GRID_AUTOFLIP=<secs>` flips the handover every `<secs>` seconds, to
 //! exercise the round-trip without clicking.
 //!
+//! `GPUI_GRID_PACE=keep|drop` (default `drop`) sets how a pane keeps up when the display is slower
+//! than its stream. `drop` holds the stream's clock — a pane whole periods late takes that many
+//! frames at once, shows the last and drops the rest — which is what live playback wants; `keep`
+//! shows every frame however slowly, which is what an offscreen consumer that sets the rate wants.
+//! The readout's `dropped/s` counts what a pane could not show.
+//!
 //! A wall of hundreds presents through a per-render budget: at most `GPUI_GRID_BUDGET` panes (default
 //! [`BUDGET`]) advance in one frame, taking turns, so the UI thread's per-render layout and upload
 //! stay bounded however fast the workers are, and the panes play at a shared rate rather than the
@@ -65,6 +71,8 @@ const DEFAULT_PERIOD: Duration = Duration::from_millis(40);
 /// How long a pane waits for a frame it asked for before giving up on the reply. Well above any real
 /// frame's latency, so it only fires for a request whose answer is never coming.
 const ADVANCE_TIMEOUT: Duration = Duration::from_millis(500);
+/// The most frames a pane asks for at once to catch up under [`Pace::Drop`], bounding the burst.
+const MAX_CATCH_UP: u32 = 4;
 /// The most panes that may present in one render unless `GPUI_GRID_BUDGET` overrides it. Bounding the
 /// per-render work keeps a wall of hundreds responsive: the UI thread lays the grid out and uploads
 /// the frames that changed, so with no cap every pane changes every frame as soon as the workers can
@@ -97,6 +105,36 @@ impl Mode {
     }
 }
 
+/// How a pane keeps up when the display cannot take frames as fast as its stream makes them.
+#[derive(Clone, Copy, PartialEq)]
+enum Pace {
+    /// Show every frame, however slowly: the pane takes one frame per render and never skips a
+    /// period, so nothing is dropped and a slow wall plays in slow motion. What an offscreen
+    /// consumer that drives the rate itself wants.
+    Keep,
+    /// Keep the stream's clock: when the pane falls whole periods behind, it asks for that many
+    /// frames at once, shows the last and drops the rest, so it stays in real time. What live
+    /// playback wants.
+    Drop,
+}
+
+impl Pace {
+    fn label(self) -> &'static str {
+        match self {
+            Pace::Keep => "keep every frame",
+            Pace::Drop => "drop to keep time",
+        }
+    }
+}
+
+/// The pacing policy: `GPUI_GRID_PACE=keep|drop`, default `drop`.
+fn pane_pace() -> Pace {
+    match std::env::var("GPUI_GRID_PACE").as_deref() {
+        Ok("keep") => Pace::Keep,
+        _ => Pace::Drop,
+    }
+}
+
 /// What a pane's worker tells the UI.
 enum ToUi {
     /// The pane opened, with its frame period.
@@ -124,10 +162,16 @@ enum Content {
 struct Pane {
     worker: flume::Sender<ToWorker>,
     content: Option<Content>,
-    /// Whether a frame is in flight, so a pane takes at most one at a time — a zero-copy pane that
-    /// took two frames and showed one would never release the one it dropped.
-    pending: bool,
-    /// When the in-flight request was sent, so a reply that never comes can be given up on.
+    /// Whether the current content has been painted. A frame displaced before it was painted was
+    /// never shown, so it is dropped — released and counted — rather than left in the dark.
+    painted: bool,
+    /// Frames this pane did not present: periods it was too slow to take, and frames displaced
+    /// before they reached the screen.
+    dropped: u64,
+    /// How many frames the pane has asked for and not yet had answered — more than one only while
+    /// catching up under [`Pace::Drop`], where the extra frames are dropped as they arrive.
+    outstanding: u32,
+    /// When the outstanding requests were sent, so a reply that never comes can be given up on.
     pending_since: Option<Instant>,
     due: Instant,
     period: Duration,
@@ -136,9 +180,9 @@ struct Pane {
 impl Pane {
     /// Ask for the next frame if one is due, returning whether one was asked for — so a caller can
     /// spend a per-render budget of asks.
-    fn tick(&mut self) -> bool {
+    fn tick(&mut self, pace: Pace) -> bool {
         let now = Instant::now();
-        if self.pending {
+        if self.outstanding > 0 {
             // A reply that never arrives — a worker that died, a message lost across a mode switch —
             // would freeze the pane for good. After long enough, give up and ask again.
             if !self
@@ -147,38 +191,57 @@ impl Pane {
             {
                 return false;
             }
-            self.pending = false;
+            self.outstanding = 0;
             self.pending_since = None;
         }
         if now < self.due {
             return false;
         }
-        if self.worker.send(ToWorker::Advance).is_err() {
-            return false;
+        // Dropping keeps the stream's clock: a pane whole periods late asks for that many frames at
+        // once, shows the last and drops the rest. Keeping asks for one, so every frame is shown
+        // however slowly the display takes them.
+        let mut wanted = 1;
+        if pace == Pace::Drop {
+            let late = now.duration_since(self.due).as_nanos();
+            let periods = (late / self.period.as_nanos().max(1)) as u32;
+            wanted = (1 + periods).min(MAX_CATCH_UP);
         }
-        self.pending = true;
+        for _ in 0..wanted {
+            if self.worker.send(ToWorker::Advance).is_err() {
+                return false;
+            }
+        }
+        self.outstanding = wanted;
         self.pending_since = Some(now);
-        // Move the deadline on by a period, so the pane keeps its stream's rate across render ticks.
-        self.due += self.period;
-        if now.duration_since(self.due) >= self.period {
+        // Move the deadline on by the periods just asked for, so the pane keeps the stream's rate.
+        self.due += self.period * wanted;
+        if pace == Pace::Drop && now.duration_since(self.due) >= self.period {
+            // Still behind even after catching up to the cap: resync, and count what could not be
+            // taken.
+            self.dropped += 1;
             self.due = now;
         }
         true
     }
 }
 
-/// The panes' cost, summed: how many frames the workers handed over, and how long their work took.
+/// The panes' cost, summed: how many frames the workers handed over, and what their work cost.
 #[derive(Default)]
 struct Metrics {
     frames: AtomicU64,
+    /// Wall time per frame, summed: the worker's latency, waiting on the hardware included.
     work_ns: AtomicU64,
+    /// CPU time per frame, summed: the worker's real cost, waiting excluded.
+    cpu_ns: AtomicU64,
 }
 
 impl Metrics {
-    fn record(&self, work: Duration) {
+    fn record(&self, work: Duration, cpu: Duration) {
         self.frames.fetch_add(1, Ordering::Relaxed);
         self.work_ns
             .fetch_add(work.as_nanos() as u64, Ordering::Relaxed);
+        self.cpu_ns
+            .fetch_add(cpu.as_nanos() as u64, Ordering::Relaxed);
     }
 }
 
@@ -201,7 +264,9 @@ struct Grid {
     /// How many drain tasks are still live, so a leak shows as a count that will not settle.
     live_tasks: Arc<AtomicUsize>,
     /// The last worker reading, for a per-second delta.
-    snapshot: (u64, u64, Instant),
+    snapshot: (u64, u64, u64, Instant),
+    /// The panes' dropped-frame total at the last reading, for a per-second delta.
+    dropped_snapshot: u64,
     /// The last render-frame count and pass times, for a per-second delta.
     phases_snapshot: (PhaseMetrics, Instant),
     /// What the header shows.
@@ -215,6 +280,8 @@ struct Grid {
     budget: usize,
     /// Where the last render's budget stopped asking, so the panes take turns.
     cursor: usize,
+    /// How panes keep up when the display cannot take frames as fast as their streams.
+    pace: Pace,
     /// TEMP: seconds after start to auto-flip to readback (then back at twice that).
     autoflip: Option<f64>,
     started: Instant,
@@ -234,8 +301,11 @@ struct Readout {
     pane_fps: f64,
     /// The workers' work per frame, in milliseconds.
     ms_per_frame: f64,
-    /// The workers' work a second, as a fraction of one core.
+    /// The workers' CPU a second, as a fraction of one core.
     cores: f64,
+    /// Frames a second the panes dropped: periods too slow to take, and frames displaced before they
+    /// were painted.
+    dropped_fps: f64,
     /// The process's RAM (resident) and VRAM (GPU-attributed) memory, in MiB, and its thread count,
     /// sampled once a second alongside the rates. On an integrated part, VRAM is system memory the
     /// GPU has reserved rather than a separate pool.
@@ -265,7 +335,8 @@ impl Grid {
             metrics: Arc::new(Metrics::default()),
             live_tasks: Arc::new(AtomicUsize::new(0)),
             phases,
-            snapshot: (0, 0, Instant::now()),
+            snapshot: (0, 0, 0, Instant::now()),
+            dropped_snapshot: 0,
             phases_snapshot: (PhaseMetrics::default(), Instant::now()),
             readout: Readout {
                 ram_mib: process_rss_mib(),
@@ -276,6 +347,7 @@ impl Grid {
             replaced: Vec::new(),
             budget: pane_budget(),
             cursor: 0,
+            pace: pane_pace(),
             autoflip: std::env::var("GPUI_GRID_AUTOFLIP").ok().and_then(|v| v.parse().ok()),
             started: Instant::now(),
             flips: 0,
@@ -302,7 +374,7 @@ impl Grid {
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.metrics = Arc::new(Metrics::default());
-        self.snapshot = (0, 0, Instant::now());
+        self.snapshot = (0, 0, 0, Instant::now());
         self.phases_snapshot = (*self.phases.borrow(), Instant::now());
 
         let count = self.cols * self.rows;
@@ -344,7 +416,9 @@ impl Grid {
             self.panes.push(Pane {
                 worker: to_worker,
                 content: None,
-                pending: false,
+                painted: false,
+                dropped: 0,
+                outstanding: 0,
                 pending_since: None,
                 due: Instant::now(),
                 period: DEFAULT_PERIOD,
@@ -367,16 +441,38 @@ impl Grid {
             match event {
                 ToUi::Opened(period) => pane.period = period,
                 ToUi::Frame(content) => {
-                    // A readback frame replaces the pane's image; keep the image it displaces so the
-                    // next render can release its atlas tile.
-                    if let Some(Content::Image(previous)) = pane.content.replace(content) {
-                        replaced = Some(previous);
+                    match pane.content.replace(content) {
+                        // The producer re-served the frame already showing (its ring had no free
+                        // slot): nothing changed, nothing dropped, nothing to release.
+                        Some(displaced) if same_surface(&displaced, pane.content.as_ref()) => {
+                            if let Content::Image(image) = displaced {
+                                replaced = Some(image);
+                            }
+                        }
+                        // The frame it displaces was shown: a readback image still needs its atlas
+                        // tile released at the next render.
+                        Some(displaced) if pane.painted => {
+                            if let Content::Image(image) = displaced {
+                                replaced = Some(image);
+                            }
+                        }
+                        // The frame it displaces was never painted — a dropped frame. A dma-buf the
+                        // renderer never sampled is never released, so release it here, and count it.
+                        Some(displaced) => {
+                            pane.dropped += 1;
+                            match displaced {
+                                Content::Surface(source) => release_surface(&source),
+                                Content::Image(image) => replaced = Some(image),
+                            }
+                        }
+                        None => {}
                     }
-                    pane.pending = false;
+                    pane.painted = false;
+                    pane.outstanding = pane.outstanding.saturating_sub(1);
                     pane.pending_since = None;
                 }
                 ToUi::Idle => {
-                    pane.pending = false;
+                    pane.outstanding = pane.outstanding.saturating_sub(1);
                     pane.pending_since = None;
                 }
             }
@@ -409,10 +505,11 @@ impl Grid {
         } else {
             self.budget.min(count)
         };
+        let pace = self.pace;
         let mut advanced = 0;
         let mut scanned = 0;
         while advanced < budget && scanned < count {
-            if self.panes[(self.cursor + scanned) % count].tick() {
+            if self.panes[(self.cursor + scanned) % count].tick(pace) {
                 advanced += 1;
             }
             scanned += 1;
@@ -425,19 +522,27 @@ impl Grid {
         // The pane workers.
         let frames = self.metrics.frames.load(Ordering::Relaxed);
         let work_ns = self.metrics.work_ns.load(Ordering::Relaxed);
-        let (last_frames, last_work_ns, at) = self.snapshot;
+        let cpu_ns = self.metrics.cpu_ns.load(Ordering::Relaxed);
+        let (last_frames, last_work_ns, last_cpu_ns, at) = self.snapshot;
         let elapsed = at.elapsed().as_secs_f64();
         if elapsed >= 1.0 {
             let delta_frames = frames.saturating_sub(last_frames) as f64;
             let delta_work = work_ns.saturating_sub(last_work_ns) as f64;
+            let delta_cpu = cpu_ns.saturating_sub(last_cpu_ns) as f64;
             self.readout.pane_fps = delta_frames / elapsed;
             self.readout.ms_per_frame = if delta_frames == 0.0 {
                 0.0
             } else {
+                // Wall time per frame: the worker's latency, hardware waits included.
                 delta_work / 1e6 / delta_frames
             };
-            self.readout.cores = delta_work / 1e9 / elapsed;
-            self.snapshot = (frames, work_ns, Instant::now());
+            // CPU time as a fraction of a core: what the workers actually burn, excluding waits.
+            self.readout.cores = delta_cpu / 1e9 / elapsed;
+            let dropped: u64 = self.panes.iter().map(|pane| pane.dropped).sum();
+            self.readout.dropped_fps =
+                dropped.saturating_sub(self.dropped_snapshot) as f64 / elapsed;
+            self.dropped_snapshot = dropped;
+            self.snapshot = (frames, work_ns, cpu_ns, Instant::now());
         }
 
         // The frame pipeline: how often the window redraws, and what its passes cost.
@@ -461,7 +566,7 @@ impl Grid {
             self.phases_snapshot = (phases, Instant::now());
             eprintln!(
                 "grid: {} panes, {} — render {:.0} fps (eval {:.2} layout {:.2} paint {:.2} ms/frame); \
-                 panes {:.0} frames/s ({:.1}/pane), {:.2} ms/frame, {:.0}% of a core; {:.0} MiB ram, {:.0} MiB vram, {} threads, {} tasks",
+                 panes {:.0} frames/s ({:.1}/pane), {:.2} ms/frame, {:.0}% cpu, {:.0} dropped/s; {:.0} MiB ram, {:.0} MiB vram, {} threads, {} tasks",
                 self.panes.len(),
                 self.mode.label(),
                 self.readout.render_fps,
@@ -472,6 +577,7 @@ impl Grid {
                 self.readout.pane_fps / self.panes.len().max(1) as f64,
                 self.readout.ms_per_frame,
                 self.readout.cores * 100.0,
+                self.readout.dropped_fps,
                 self.readout.ram_mib,
                 self.readout.vram_mib,
                 self.readout.threads,
@@ -539,7 +645,7 @@ impl Render for Grid {
                 ),
             )
             .child(format!(
-                "{} panes ({}x{}) · {}",
+                "{} panes ({}x{}) · {} · {}",
                 self.panes.len(),
                 self.cols,
                 self.rows,
@@ -548,6 +654,7 @@ impl Render for Grid {
                 } else {
                     format!("budget {}/render", self.budget.min(self.panes.len()))
                 },
+                self.pace.label(),
             ))
             .child(format!(
                 "render {:.0} fps (eval {:.1} + layout {:.1} + paint {:.1} ms)",
@@ -557,11 +664,12 @@ impl Render for Grid {
                 readout.render_paint_ms,
             ))
             .child(format!(
-                "panes {:.0} frames/s ({:.1}/pane) · {:.2} ms/frame · {:.0}% of a core",
+                "panes {:.0} frames/s ({:.1}/pane) · {:.2} ms/frame · {:.0}% cpu · {:.0} dropped/s",
                 readout.pane_fps,
                 readout.pane_fps / self.panes.len().max(1) as f64,
                 readout.ms_per_frame,
                 readout.cores * 100.0,
+                readout.dropped_fps,
             ))
             .child(format!(
                 "ram {:.0} MiB · vram {:.0} MiB · {} threads",
@@ -577,6 +685,14 @@ impl Render for Grid {
                 row = row.child(pane_view(pane, self.cell));
             }
             rows.push(row);
+        }
+
+        // Everything with content is painted this frame, so a frame that arrives before the next
+        // render displaces a painted one rather than a dropped one.
+        for pane in &mut self.panes {
+            if pane.content.is_some() {
+                pane.painted = true;
+            }
         }
 
         div()
@@ -617,6 +733,44 @@ fn pane_view(pane: &Pane, cell: (f32, f32)) -> AnyElement {
             .h(px(cell.1))
             .bg(rgb(0x202028))
             .into_any_element(),
+    }
+}
+
+/// The calling thread's CPU time, in nanoseconds, from the per-thread clock. Unlike wall time it
+/// does not count blocking — a worker waiting on the hardware decoder is idle, not busy — so what is
+/// built from it is real CPU.
+fn thread_cpu_ns() -> u64 {
+    let mut spec = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `spec` is a valid, writable `timespec`, and the clock id is a constant.
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
+        return 0;
+    }
+    (spec.tv_sec as u64) * 1_000_000_000 + (spec.tv_nsec as u64)
+}
+
+/// Whether two contents are the same dma-buf, so a producer that re-serves the frame already showing
+/// is not mistaken for a new one the pane should drop and release.
+fn same_surface(a: &Content, b: Option<&Content>) -> bool {
+    match (a, b) {
+        (Content::Surface(a), Some(Content::Surface(b))) => a == b,
+        _ => false,
+    }
+}
+
+/// Release a surface a pane dropped without painting it, so the producer's bounded ring does not
+/// wait on a frame nothing ever sampled.
+fn release_surface(source: &SurfaceSource) {
+    match source {
+        #[cfg(target_os = "linux")]
+        SurfaceSource::DmaBuf(handle) => handle.signal_release(),
+        #[allow(
+            unreachable_patterns,
+            reason = "the other platform sources do not exist here"
+        )]
+        _ => {}
     }
 }
 
@@ -661,10 +815,14 @@ fn surface_worker(
     start_at(playback.duration(), frac).map(|at| playback.seek(at));
     let _ = to_ui.send(ToUi::Opened(playback.frame_period().unwrap_or(DEFAULT_PERIOD)));
     while let Ok(ToWorker::Advance) = requests.recv() {
-        let start = Instant::now();
+        let started = Instant::now();
+        let cpu_before = thread_cpu_ns();
         match playback.surface() {
             Some(source) => {
-                metrics.record(start.elapsed());
+                metrics.record(
+                    started.elapsed(),
+                    Duration::from_nanos(thread_cpu_ns().saturating_sub(cpu_before)),
+                );
                 if to_ui.send(ToUi::Frame(Content::Surface(source))).is_err() {
                     break;
                 }
@@ -767,9 +925,13 @@ fn readback_worker(
         if scratch.is_none() {
             scratch = frame.readback();
         }
-        let start = Instant::now();
+        let started = Instant::now();
+        let cpu_before = thread_cpu_ns();
         let read = scratch.as_mut().and_then(|scratch| scratch.read(&frame));
-        metrics.record(start.elapsed());
+        metrics.record(
+            started.elapsed(),
+            Duration::from_nanos(thread_cpu_ns().saturating_sub(cpu_before)),
+        );
         let _ = permits.send(());
         let Some(read) = read else {
             if to_ui.send(ToUi::Idle).is_err() {

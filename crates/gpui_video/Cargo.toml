@@ -36,3 +36,5 @@ gpui = { workspace = true, features = ["platform"] }
 # The grid example builds a `RenderImage` from a read-back frame, so it names the image buffer type.
 image.workspace = true
 smallvec.workspace = true
+# The grid example measures its workers' CPU time, which the standard library does not expose.
+libc.workspace = true
