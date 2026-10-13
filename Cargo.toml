@@ -28,12 +28,13 @@ gpui_va = { version = "0.1.0", path = "crates/gpui_va" }
 gpui_video = { version = "0.1.0", path = "crates/gpui_video" }
 gpui_video_platform = { version = "0.1.0", path = "crates/gpui_video_platform" }
 
-# The core this stack is built on, wired to the sibling `bite-gpui` checkout for development and
-# carrying the version a release will resolve from crates.io once the core is published there.
-gpui = { version = "0.2.2", path = "../bite-gpui/crates/gpui", default-features = false }
-gpui_authoring = { version = "0.2.2", path = "../bite-gpui/crates/gpui_authoring" }
-gpui_engine = { version = "0.1.0", path = "../bite-gpui/crates/gpui_engine" }
-gpui_wgpu = { version = "0.1.0", path = "../bite-gpui/crates/gpui_wgpu" }
+# The core this stack is built on. Development takes it from its branch; on release each `git` and
+# `branch` pair is replaced by the core's published `version = "1.23"`, which a published crate has
+# to depend on instead of a git source.
+gpui = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas", default-features = false }
+gpui_authoring = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
+gpui_engine = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
+gpui_wgpu = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
 
 # Third-party, at the versions the core resolves to, so one graph holds one copy of each.
 anyhow = "1.0.86"
