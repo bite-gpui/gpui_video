@@ -1,0 +1,36 @@
+# gpui_video's own CI.
+#
+# The workspace is where the surface path's producer side is developed, so the gate is that it still
+# builds and its host-independent tests still pass. The tests that need a device -- the dma-buf
+# surface test behind `test-support`, and the read-back bench -- are opt-in and are not run here: a
+# hosted runner has no GPU, and the surface test is written to skip rather than fail for exactly that
+# reason, so running it would assert nothing.
+#
+# The core comes in as a git dependency, so this builds it from source; the `check` is where a change
+# to the core that breaks the producer side is caught.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: cargo check --workspace (ubuntu-latest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The system libraries the core's crates link against, the same set `bite-gpui`'s own
+      # `script/linux` installs on a Debian-family host.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake clang lld llvm pkg-config \
+            elfutils gettext-base jq \
+            libasound2-dev libfontconfig-dev libgit2-dev libglib2.0-dev \
+            libsqlite3-dev libssl-dev libva-dev libvulkan1 libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev
+      - run: cargo check --workspace --all-targets
+      - run: cargo test --workspace --lib
