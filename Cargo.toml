@@ -1,0 +1,86 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gpui_va",
+    "crates/gpui_video",
+    "crates/gpui_video_platform",
+]
+
+[workspace.package]
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/bite-gpui/gpui_video"
+# The registries this workspace may be published to; `crates-io` is the default.
+publish = ["crates-io"]
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "allow" }
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+declare_interior_mutable_const = "deny"
+redundant_clone = "deny"
+
+[workspace.dependencies]
+# This repo's own crates: a path for development, a version for release.
+gpui_va = { version = "0.1.0", path = "crates/gpui_va" }
+gpui_video = { version = "0.1.0", path = "crates/gpui_video" }
+gpui_video_platform = { version = "0.1.0", path = "crates/gpui_video_platform" }
+
+# The core this stack is built on, wired to the sibling `bite-gpui` checkout for development and
+# carrying the version a release will resolve from crates.io once the core is published there.
+gpui = { version = "0.2.2", path = "../bite-gpui/crates/gpui", default-features = false }
+gpui_authoring = { version = "0.2.2", path = "../bite-gpui/crates/gpui_authoring" }
+gpui_engine = { version = "0.1.0", path = "../bite-gpui/crates/gpui_engine" }
+gpui_wgpu = { version = "0.1.0", path = "../bite-gpui/crates/gpui_wgpu" }
+
+# Third-party, at the versions the core resolves to, so one graph holds one copy of each.
+anyhow = "1.0.86"
+flume = "0.12"
+image = { version = "0.25.1", default-features = false, features = [
+    "bmp",
+    "dds",
+    "exr",
+    "ff",
+    "gif",
+    "hdr",
+    "ico",
+    "jpeg",
+    "png",
+    "pnm",
+    "qoi",
+    "rayon",
+    "tga",
+    "tiff",
+    "webp",
+] }
+libc = "0.2"
+log = { version = "0.4.16", features = ["kv_unstable_serde", "serde"] }
+smallvec = { version = "1.6", features = ["union", "const_new"] }
+
+# The renderer the `surface` example and its dma-buf test drive directly.
+wgpu = "29.0.4"
+
+# The `surface` example's other, non-Linux arms.
+core-foundation = "0.10"
+core-video = { version = "0.5.2", features = ["metal"] }
+foreign-types = "0.5"
+metal = "0.33"
+pollster = "0.4.0"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_LibraryLoader",
+] }
+
+# The core is developed against a few forked crates, and patches only apply from the root workspace,
+# so whichever repo builds it has to carry them.
+[patch.crates-io]
+tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
+async-process = { git = "https://github.com/zed-industries/async-process.git", rev = "0b6d6713570af61806e1e5cb40e0f757cb93fd9d" }
+async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
+calloop = { git = "https://github.com/zed-industries/calloop" }

@@ -12,6 +12,11 @@ workspace = true
 path = "src/gpui_va.rs"
 doctest = false
 
+[features]
+# Opt into the dma-buf surface test, which needs a real Vulkan device and reads a frame back. Nothing
+# in the library is behind it; the test is, so an ordinary unit-test run stays device-free.
+test-support = []
+
 # A producer for the surface path is Linux-only and needs `libva` and a Vulkan device, so every
 # dependency is scoped to Linux and the crate is empty elsewhere.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -27,3 +32,24 @@ libloading = "0.8"
 ash = "0.38"
 # `eventfd`, and the `poll` a playback waits on a consumer's release with.
 libc.workspace = true
+
+# The `surface` example and the dma-buf test name the renderer and window directly, so the consumer
+# crates they need are dev-dependencies: the producer's own graph stays free of them.
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+gpui = { workspace = true, features = ["platform", "test-support"] }
+gpui_wgpu = { workspace = true, features = ["test-support"] }
+wgpu.workspace = true
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+gpui = { workspace = true, features = ["platform"] }
+core-foundation.workspace = true
+core-video.workspace = true
+foreign-types.workspace = true
+metal.workspace = true
+pollster.workspace = true
+wgpu.workspace = true
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+gpui = { workspace = true, features = ["platform"] }
+windows.workspace = true
+wgpu.workspace = true
