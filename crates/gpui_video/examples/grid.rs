@@ -30,6 +30,12 @@
 //! shows every frame however slowly, which is what an offscreen consumer that sets the rate wants.
 //! The readout's `dropped/s` counts what a pane could not show.
 //!
+//! `GPUI_GRID_SCALE=fit|native` (default `fit`) sets how a readback frame is converted for its
+//! pane. `fit` converts straight to the pane's size — swscale scales as it converts — so the UI
+//! thread uploads only the pixels the pane shows, which is where readback costs the most; `native`
+//! converts at the stream's size and lets the GPU scale it when it draws. Only the readback path
+//! can downscale: a dma-buf is the decoder's own surface, which the GPU already scales on sample.
+//!
 //! A wall of hundreds presents through a per-render budget: at most `GPUI_GRID_BUDGET` panes (default
 //! [`BUDGET`]) advance in one frame, taking turns, so the UI thread's per-render layout and upload
 //! stay bounded however fast the workers are, and the panes play at a shared rate rather than the
@@ -133,6 +139,44 @@ fn pane_pace() -> Pace {
         Ok("keep") => Pace::Keep,
         _ => Pace::Drop,
     }
+}
+
+/// How a readback frame is converted for the pane it will be drawn in.
+#[derive(Clone, Copy, PartialEq)]
+enum Scale {
+    /// Convert it straight to the pane's size, so the UI thread uploads only the pixels the pane
+    /// shows. Only the readback path can do this; a dma-buf is the decoder's own surface.
+    Fit,
+    /// Convert it at the stream's own size and let the GPU scale it when it draws.
+    Native,
+}
+
+impl Scale {
+    fn label(self) -> &'static str {
+        match self {
+            Scale::Fit => "fit to pane",
+            Scale::Native => "native size",
+        }
+    }
+}
+
+/// `GPUI_GRID_SCALE=fit|native`, default `fit`.
+fn pane_scale() -> Scale {
+    match std::env::var("GPUI_GRID_SCALE").as_deref() {
+        Ok("native") => Scale::Native,
+        _ => Scale::Fit,
+    }
+}
+
+/// Where a frame of `source` pixels fits into a `box_size` box, keeping its aspect and never
+/// upscaling — the GPU's bilinear upscale is cheaper than a CPU one, so there is nothing to gain.
+fn contain_size(source: (u32, u32), box_size: (f32, f32)) -> (u32, u32) {
+    let (source_w, source_h) = (source.0.max(1) as f32, source.1.max(1) as f32);
+    let scale = (box_size.0 / source_w).min(box_size.1 / source_h).min(1.0);
+    (
+        (source_w * scale).round().max(1.0) as u32,
+        (source_h * scale).round().max(1.0) as u32,
+    )
 }
 
 /// What a pane's worker tells the UI.
@@ -256,7 +300,11 @@ struct Grid {
     /// The fixed pane size, computed once from the window so the grid fills it and nothing is
     /// measured per pane.
     cell: (f32, f32),
+    /// The window's scale factor, so a readback's target is computed in device pixels.
+    scale: f32,
     mode: Mode,
+    /// How readback frames are converted for their pane.
+    scale_mode: Scale,
     /// The pane workers' cost.
     metrics: Arc<Metrics>,
     /// The frame pipeline's own timing, for the render rate.
@@ -321,6 +369,7 @@ impl Grid {
         rows: usize,
         window: (f32, f32),
         mode: Mode,
+        scale: f32,
         phases: Rc<RefCell<PhaseMetrics>>,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -331,7 +380,9 @@ impl Grid {
             cols,
             rows,
             cell: cell_size(window, cols, rows),
+            scale,
             mode,
+            scale_mode: pane_scale(),
             metrics: Arc::new(Metrics::default()),
             live_tasks: Arc::new(AtomicUsize::new(0)),
             phases,
@@ -383,12 +434,16 @@ impl Grid {
             let frac = index as f64 / count as f64;
             let mode = self.mode;
             let metrics = self.metrics.clone();
+            let fit = match self.scale_mode {
+                Scale::Fit => Some((self.cell.0 * self.scale, self.cell.1 * self.scale)),
+                Scale::Native => None,
+            };
             let (to_ui, from_worker) = flume::unbounded::<ToUi>();
             let (to_worker, for_worker) = flume::unbounded::<ToWorker>();
 
             let spawned = std::thread::Builder::new()
                 .name(format!("grid-pane-{index}"))
-                .spawn(move || worker(path, frac, mode, for_worker, to_ui, metrics));
+                .spawn(move || worker(path, frac, mode, for_worker, to_ui, metrics, fit));
             if spawned.is_err() {
                 eprintln!("grid: could not start a worker thread");
                 continue;
@@ -645,7 +700,7 @@ impl Render for Grid {
                 ),
             )
             .child(format!(
-                "{} panes ({}x{}) · {} · {}",
+                "{} panes ({}x{}) · {} · {} · {}",
                 self.panes.len(),
                 self.cols,
                 self.rows,
@@ -655,6 +710,7 @@ impl Render for Grid {
                     format!("budget {}/render", self.budget.min(self.panes.len()))
                 },
                 self.pace.label(),
+                self.scale_mode.label(),
             ))
             .child(format!(
                 "render {:.0} fps (eval {:.1} + layout {:.1} + paint {:.1} ms)",
@@ -793,10 +849,11 @@ fn worker(
     requests: flume::Receiver<ToWorker>,
     to_ui: flume::Sender<ToUi>,
     metrics: Arc<Metrics>,
+    fit: Option<(f32, f32)>,
 ) {
     match mode {
         Mode::Surface => surface_worker(path, frac, requests, to_ui, metrics),
-        Mode::Readback => readback_worker(path, frac, requests, to_ui, metrics),
+        Mode::Readback => readback_worker(path, frac, requests, to_ui, metrics, fit),
     }
 }
 
@@ -876,6 +933,7 @@ fn readback_worker(
     requests: flume::Receiver<ToWorker>,
     to_ui: flume::Sender<ToUi>,
     metrics: Arc<Metrics>,
+    fit: Option<(f32, f32)>,
 ) {
     let Some(mut demuxer) = Demuxer::open(&path) else {
         eprintln!("grid: cannot open {}", path.display());
@@ -927,7 +985,17 @@ fn readback_worker(
         }
         let started = Instant::now();
         let cpu_before = thread_cpu_ns();
-        let read = scratch.as_mut().and_then(|scratch| scratch.read(&frame));
+        // Convert straight to the pane's size where asked, so the upload carries only what it shows.
+        let (dst_width, dst_height) = match fit {
+            Some(box_size) => contain_size(
+                (frame.handle().width, frame.handle().height),
+                box_size,
+            ),
+            None => (0, 0),
+        };
+        let read = scratch
+            .as_mut()
+            .and_then(|scratch| scratch.read_to(&frame, dst_width, dst_height));
         metrics.record(
             started.elapsed(),
             Duration::from_nanos(thread_cpu_ns().saturating_sub(cpu_before)),
@@ -1089,7 +1157,8 @@ fn main() {
                     is_resizable: false,
                     ..Default::default()
                 },
-                move |_, cx| {
+                move |window, cx| {
+                    let scale = window.scale_factor();
                     cx.new(|cx| {
                         Grid::new(
                             grid_sources.clone(),
@@ -1097,6 +1166,7 @@ fn main() {
                             rows,
                             (window_w, window_h),
                             mode,
+                            scale,
                             phases.clone(),
                             cx,
                         )

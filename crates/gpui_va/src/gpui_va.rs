@@ -1505,14 +1505,17 @@ mod codec {
         }
     }
 
-    /// The libswscale convert context for one source geometry and colour space, created on first use
-    /// and recreated when either changes. One context is reused across a stream's frames, which is
-    /// what keeps the conversion cheap; rebuilding it per frame would negate the accelerator.
+    /// The libswscale convert context for one source geometry, destination geometry and colour space,
+    /// created on first use and recreated when any of them changes. One context is reused across a
+    /// stream's frames, which is what keeps the conversion cheap; rebuilding it per frame would
+    /// negate the accelerator.
     struct Sws {
         symbols: SwsSymbols,
         context: *mut c_void,
         width: usize,
         height: usize,
+        dst_width: usize,
+        dst_height: usize,
         color_space: gpui_engine::YuvColorSpace,
     }
 
@@ -1523,22 +1526,28 @@ mod codec {
                 context: std::ptr::null_mut(),
                 width: 0,
                 height: 0,
+                dst_width: 0,
+                dst_height: 0,
                 color_space: gpui_engine::YuvColorSpace::default(),
             }
         }
 
-        /// The context for a `width`x`height` `NV12` frame in `color_space`, built if this is the
-        /// first call or either changed. `None` where libswscale refuses the geometry, so the caller
-        /// falls back to the scalar walk.
+        /// The context converting a `width`x`height` `NV12` frame to `dst_width`x`dst_height` `BGRA`
+        /// in `color_space`, built if this is the first call or any of them changed. `None` where
+        /// libswscale refuses the geometry, so the caller falls back to the scalar walk.
         unsafe fn context_for(
             &mut self,
             width: usize,
             height: usize,
+            dst_width: usize,
+            dst_height: usize,
             color_space: gpui_engine::YuvColorSpace,
         ) -> Option<*mut c_void> {
             if !self.context.is_null()
                 && self.width == width
                 && self.height == height
+                && self.dst_width == dst_width
+                && self.dst_height == dst_height
                 && self.color_space == color_space
             {
                 return Some(self.context);
@@ -1551,8 +1560,8 @@ mod codec {
                 width as c_int,
                 height as c_int,
                 AV_PIX_FMT_NV12,
-                width as c_int,
-                height as c_int,
+                dst_width as c_int,
+                dst_height as c_int,
                 AV_PIX_FMT_BGRA,
                 SWS_BILINEAR,
                 std::ptr::null_mut(),
@@ -1580,15 +1589,19 @@ mod codec {
             self.context = context;
             self.width = width;
             self.height = height;
+            self.dst_width = dst_width;
+            self.dst_height = dst_height;
             self.color_space = color_space;
             Some(context)
         }
 
-        /// Convert a `NV12` frame's planes into packed `BGRA8` at `out`, or `false` where libswscale
-        /// will not take the frame and the caller must fall back.
+        /// Convert a `NV12` frame's planes into packed `BGRA8` at `out`, scaled to
+        /// `dst_width`x`dst_height`, or `false` where libswscale will not take the frame and the
+        /// caller must fall back.
         ///
         /// SAFETY: the caller guarantees the planes cover `width`x`height` for the strides given, and
-        /// that `out` is at least `width * height * 4` bytes.
+        /// that `out` is at least `dst_width * dst_height * 4` bytes.
+        #[allow(clippy::too_many_arguments)]
         unsafe fn convert(
             &mut self,
             luma: *const u8,
@@ -1597,16 +1610,20 @@ mod codec {
             chroma_stride: c_int,
             width: usize,
             height: usize,
+            dst_width: usize,
+            dst_height: usize,
             color_space: gpui_engine::YuvColorSpace,
             out: *mut u8,
         ) -> bool {
-            let Some(context) = self.context_for(width, height, color_space) else {
+            let Some(context) =
+                self.context_for(width, height, dst_width, dst_height, color_space)
+            else {
                 return false;
             };
             let src_data = [luma, chroma, std::ptr::null(), std::ptr::null()];
             let src_stride = [luma_stride, chroma_stride, 0, 0];
             let mut dst_data = [out, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()];
-            let dst_stride = [(width * 4) as c_int, 0, 0, 0];
+            let dst_stride = [(dst_width * 4) as c_int, 0, 0, 0];
             (self.symbols.scale)(
                 context,
                 src_data.as_ptr(),
@@ -2033,6 +2050,8 @@ mod codec {
                         chroma_stride,
                         width,
                         height,
+                        width,
+                        height,
                         color_space,
                         &mut bgra,
                         sws.as_mut(),
@@ -2131,8 +2150,11 @@ mod codec {
     /// Convert an `NV12` frame's planes into packed `BGRA8` in `out`, through `sws_scale` where a
     /// libswscale context is given and libswscale accepts the frame, and the scalar walk otherwise.
     ///
+    /// `sws_scale` scales as it converts, so a `dst` smaller than the source downscales in one pass.
+    /// The scalar walk cannot scale, so it is reached only when the destination is the source size.
+    ///
     /// SAFETY: the caller guarantees the planes cover `width`x`height` for the strides given, and
-    /// that `out` is at least `width * height * 4` bytes.
+    /// that `out` is at least `dst_width * dst_height * 4` bytes.
     #[allow(clippy::too_many_arguments)]
     unsafe fn convert_nv12_to_bgra(
         luma: *const u8,
@@ -2141,6 +2163,8 @@ mod codec {
         chroma_stride: c_int,
         width: usize,
         height: usize,
+        dst_width: usize,
+        dst_height: usize,
         color_space: gpui_engine::YuvColorSpace,
         out: &mut [u8],
         sws: Option<&mut Sws>,
@@ -2153,22 +2177,26 @@ mod codec {
                 chroma_stride,
                 width,
                 height,
+                dst_width,
+                dst_height,
                 color_space,
                 out.as_mut_ptr(),
             ) {
                 return;
             }
         }
-        nv12_to_bgra(
-            luma,
-            luma_stride,
-            chroma,
-            chroma_stride,
-            width,
-            height,
-            color_space,
-            out,
-        );
+        if dst_width == width && dst_height == height {
+            nv12_to_bgra(
+                luma,
+                luma_stride,
+                chroma,
+                chroma_stride,
+                width,
+                height,
+                color_space,
+                out,
+            );
+        }
     }
 
     impl Drop for Frame {
@@ -2225,8 +2253,22 @@ mod codec {
     }
 
     impl Readback {
-        /// Transfer `frame` to the CPU and convert it into this scratch's buffers, reusing them.
+        /// Transfer `frame` to the CPU and convert it into this scratch's buffers, reusing them, at
+        /// the frame's own size.
         pub fn read(&mut self, frame: &Frame) -> Option<ReadbackFrame<'_>> {
+            self.read_to(frame, 0, 0)
+        }
+
+        /// [`read`](Self::read), but converting to `dst_width`x`dst_height` — downscaling while it
+        /// converts, so a caller that knows the size it will draw at uploads only the pixels it
+        /// shows. A size of zero, or a machine without libswscale (whose scalar fallback cannot
+        /// scale), keeps the frame's own size; the returned width and height are what was produced.
+        pub fn read_to(
+            &mut self,
+            frame: &Frame,
+            dst_width: u32,
+            dst_height: u32,
+        ) -> Option<ReadbackFrame<'_>> {
             let symbols = self.symbols;
             // SAFETY: the software frame is this scratch's and alive; `frame`'s hardware frame is
             // alive for the borrow.
@@ -2243,10 +2285,18 @@ mod codec {
                 let chroma = (*self.software).data[1];
                 let luma_stride = (*self.software).linesize[0];
                 let chroma_stride = (*self.software).linesize[1];
-                let len = width * height * 4;
+                // Scaling is libswscale's alone; without it, the scalar walk converts at the
+                // source size, so the output is the source size too.
+                let (out_width, out_height) = if self.sws.is_some() && dst_width > 0 && dst_height > 0
+                {
+                    (dst_width as usize, dst_height as usize)
+                } else {
+                    (width, height)
+                };
+                let len = out_width * out_height * 4;
                 if self.bgra.len() != len {
-                    // Only the first read sizes it; later reads reuse the same pages, so the
-                    // conversion writes memory that is already resident.
+                    // Sizes it on the first read and whenever the destination changes; later reads
+                    // reuse the same pages, so the conversion writes memory that is already resident.
                     self.bgra.resize(len, 0);
                 }
                 let convert_start = Instant::now();
@@ -2258,6 +2308,8 @@ mod codec {
                         chroma_stride,
                         width,
                         height,
+                        out_width,
+                        out_height,
                         frame.handle.color_space,
                         &mut self.bgra,
                         self.sws.as_mut(),
@@ -2265,8 +2317,8 @@ mod codec {
                 }
                 let convert = convert_start.elapsed();
                 Some(ReadbackFrame {
-                    width: width as u32,
-                    height: height as u32,
+                    width: out_width as u32,
+                    height: out_height as u32,
                     bgra: &self.bgra,
                     transfer,
                     convert,
@@ -2351,6 +2403,8 @@ mod codec {
                         width as c_int,
                         staging.as_ptr().add(luma_len),
                         width as c_int,
+                        width,
+                        height,
                         width,
                         height,
                         frame.handle.color_space,
@@ -2639,6 +2693,8 @@ mod codec {
                         width as c_int,
                         chroma.as_ptr(),
                         width as c_int,
+                        width,
+                        height,
                         width,
                         height,
                         color_space,
