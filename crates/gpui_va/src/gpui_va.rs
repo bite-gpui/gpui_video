@@ -26,11 +26,22 @@
 
 use std::collections::VecDeque;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_engine::DmaBufHandle;
+
+/// The DRM render node the window renderer draws through, as a `gpu_canvas` reported it to
+/// `gpui_interop`.
+///
+/// `None` until a canvas has reported the GPU, and there is deliberately no fallback: a VA surface is
+/// a dma-buf the renderer imports, so it is importable only on the renderer's own GPU, and a node
+/// chosen by hand is one the renderer cannot sample. A producer with no GPU to name does nothing
+/// rather than export a surface the consumer will refuse.
+fn render_node() -> Option<PathBuf> {
+    gpui_interop::gpu_id().and_then(|gpu| gpu.render_node)
+}
 
 /// A VA-API surface, kept alive for as long as the renderer samples its dma-buf.
 pub struct Surface {
@@ -109,7 +120,7 @@ pub use codec::{CpuFrame, Decoder, Demuxer, Frame, Readback, ReadbackFrame, Stag
 /// The producer seam: a playback hands the surface path each decoded frame as its period comes due.
 impl gpui_video_platform::SurfaceProducer for Playback {
     fn surface(&mut self) -> Option<gpui_engine::SurfaceSource> {
-        self.next().map(Into::into)
+        self.next_frame().map(Into::into)
     }
 }
 
@@ -311,7 +322,7 @@ impl Playback {
     /// surface to the decoder's pool. A consumer that takes a frame and never shows it must signal
     /// that handle's [`release`](gpui_engine::DmaBufHandle::release) itself — a frame nothing ever
     /// samples is a frame nothing ever releases, and the ring waits on it for good.
-    pub fn next(&mut self) -> Option<DmaBufHandle> {
+    pub fn next_frame(&mut self) -> Option<DmaBufHandle> {
         self.recycle();
         if self.live.len() < self.depth {
             if self.queued.is_empty() {
@@ -365,8 +376,8 @@ impl Playback {
             // Reclaim a frame the consumer released, or one it never released at all: a frame that
             // was handed out and then dropped before it reached the screen signals nothing, and the
             // ring must not wait on it for good.
-            let recyclable = release_signalled(&front.release)
-                || front.handed.elapsed() >= RELEASE_TIMEOUT;
+            let recyclable =
+                release_signalled(&front.release) || front.handed.elapsed() >= RELEASE_TIMEOUT;
             if !recyclable {
                 break;
             }
@@ -456,19 +467,21 @@ impl Playback {
                     Fed::Stalled
                 }
             }
-            Source::Container { demuxer, ended, .. } => match demuxer.send_next(&mut self.decoder) {
-                Ok(true) => Fed::Worked,
-                Ok(false) if !*ended => {
-                    if self.decoder.finish().is_err() {
-                        return Fed::Stalled;
+            Source::Container { demuxer, ended, .. } => {
+                match demuxer.send_next(&mut self.decoder) {
+                    Ok(true) => Fed::Worked,
+                    Ok(false) if !*ended => {
+                        if self.decoder.finish().is_err() {
+                            return Fed::Stalled;
+                        }
+                        *ended = true;
+                        Fed::Worked
                     }
-                    *ended = true;
-                    Fed::Worked
+                    Ok(false) if self.queued.is_empty() => Fed::Drained,
+                    Ok(false) => Fed::Stalled,
+                    Err(_) => Fed::Stalled,
                 }
-                Ok(false) if self.queued.is_empty() => Fed::Drained,
-                Ok(false) => Fed::Stalled,
-                Err(_) => Fed::Stalled,
-            },
+            }
         }
     }
 
@@ -530,8 +543,8 @@ fn fill_tiled(handle: &DmaBufHandle, colour: [u8; 4]) -> anyhow::Result<()> {
 
     use ash::vk;
 
-    let entry = unsafe { ash::Entry::load() }
-        .map_err(|error| anyhow::anyhow!("load vulkan: {error}"))?;
+    let entry =
+        unsafe { ash::Entry::load() }.map_err(|error| anyhow::anyhow!("load vulkan: {error}"))?;
     let app_info = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
     let instance = unsafe {
         entry.create_instance(
@@ -676,7 +689,7 @@ fn fill_tiled(handle: &DmaBufHandle, colour: [u8; 4]) -> anyhow::Result<()> {
         )? as *mut u8;
         let bytes = std::slice::from_raw_parts_mut(mapped, (luma_size + chroma_size) as usize);
         bytes[..luma_size as usize].fill(y);
-        for pair in bytes[luma_size as usize..].chunks_exact_mut(2) {
+        for pair in bytes[luma_size as usize..].as_chunks_mut::<2>().0 {
             pair[0] = cb;
             pair[1] = cr;
         }
@@ -807,7 +820,11 @@ fn fill_tiled(handle: &DmaBufHandle, colour: [u8; 4]) -> anyhow::Result<()> {
 
         let fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
         let commands = [command];
-        device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&commands)], fence)?;
+        device.queue_submit(
+            queue,
+            &[vk::SubmitInfo::default().command_buffers(&commands)],
+            fence,
+        )?;
         device.wait_for_fences(&[fence], true, u64::MAX)?;
         device.device_wait_idle()?;
 
@@ -938,13 +955,15 @@ mod ffmpeg {
         let codec = format!("libavcodec.so.{codec_major}");
         let util = format!("libavutil.so.{util_major}");
         // One representative symbol per library, by version tag: this is the ABI assertion.
-        if !probe(&codec, "avcodec_find_decoder", &format!("LIBAVCODEC_{codec_major}"))
-            || !probe(
-                &util,
-                "av_hwdevice_ctx_create",
-                &format!("LIBAVUTIL_{util_major}"),
-            )
-        {
+        if !probe(
+            &codec,
+            "avcodec_find_decoder",
+            &format!("LIBAVCODEC_{codec_major}"),
+        ) || !probe(
+            &util,
+            "av_hwdevice_ctx_create",
+            &format!("LIBAVUTIL_{util_major}"),
+        ) {
             return None;
         }
         let codec = unsafe { dlopen(CString::new(codec).ok()?.as_ptr(), RTLD_NOW) };
@@ -1117,7 +1136,11 @@ mod codec {
     /// definition is BT.601, high definition BT.709. A stream that names no range is taken as
     /// limited — the studio range real streams are almost always in, and the range a full-range
     /// buffer read as limited only loses contrast over, where the reverse clips.
-    fn color_space(colorspace: c_int, color_range: c_int, height: c_int) -> gpui_engine::YuvColorSpace {
+    fn color_space(
+        colorspace: c_int,
+        color_range: c_int,
+        height: c_int,
+    ) -> gpui_engine::YuvColorSpace {
         use gpui_engine::{YuvColorSpace, YuvMatrix, YuvRange};
 
         // `AVCOL_RANGE_JPEG` is the only range that means full; `MPEG` and `UNSPECIFIED` are limited.
@@ -1265,11 +1288,17 @@ mod codec {
         assert!(core::mem::offset_of!(AvStream, avg_frame_rate) == 88);
     };
 
-    type HwDeviceCtxCreate =
-        unsafe extern "C" fn(*mut *mut AvBufferRef, c_int, *const c_char, *mut c_void, c_int) -> c_int;
+    type HwDeviceCtxCreate = unsafe extern "C" fn(
+        *mut *mut AvBufferRef,
+        c_int,
+        *const c_char,
+        *mut c_void,
+        c_int,
+    ) -> c_int;
     type FindDecoderByName = unsafe extern "C" fn(*const c_char) -> *const c_void;
     type AllocContext3 = unsafe extern "C" fn(*const c_void) -> *mut AvCodecContext;
-    type Open2 = unsafe extern "C" fn(*mut AvCodecContext, *const c_void, *mut *mut c_void) -> c_int;
+    type Open2 =
+        unsafe extern "C" fn(*mut AvCodecContext, *const c_void, *mut *mut c_void) -> c_int;
     type SendPacket = unsafe extern "C" fn(*mut AvCodecContext, *const AvPacket) -> c_int;
     type ReceiveFrame = unsafe extern "C" fn(*mut AvCodecContext, *mut AvFrame) -> c_int;
     type FreeContext = unsafe extern "C" fn(*mut *mut AvCodecContext);
@@ -1280,8 +1309,7 @@ mod codec {
     type FrameFree = unsafe extern "C" fn(*mut *mut AvFrame);
     /// `av_hwframe_transfer_data`: copies a hardware frame into a software one, which is the GPU→CPU
     /// readback a player that does not import the buffer pays for.
-    type HwFrameTransferData =
-        unsafe extern "C" fn(*mut AvFrame, *const AvFrame, c_int) -> c_int;
+    type HwFrameTransferData = unsafe extern "C" fn(*mut AvFrame, *const AvFrame, c_int) -> c_int;
     type BufferRef = unsafe extern "C" fn(*mut AvBufferRef) -> *mut AvBufferRef;
     type BufferUnref = unsafe extern "C" fn(*mut *mut AvBufferRef);
     type ParserInit = unsafe extern "C" fn(c_int) -> *mut c_void;
@@ -1615,14 +1643,18 @@ mod codec {
             color_space: gpui_engine::YuvColorSpace,
             out: *mut u8,
         ) -> bool {
-            let Some(context) =
-                self.context_for(width, height, dst_width, dst_height, color_space)
+            let Some(context) = self.context_for(width, height, dst_width, dst_height, color_space)
             else {
                 return false;
             };
             let src_data = [luma, chroma, std::ptr::null(), std::ptr::null()];
             let src_stride = [luma_stride, chroma_stride, 0, 0];
-            let mut dst_data = [out, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut()];
+            let mut dst_data = [
+                out,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            ];
             let dst_stride = [(dst_width * 4) as c_int, 0, 0, 0];
             (self.symbols.scale)(
                 context,
@@ -1727,15 +1759,22 @@ mod codec {
             };
             // From here any `?` drops `decoder`, freeing whatever has been built.
             let symbols = decoder.symbols;
+            // ffmpeg's VA device, on the renderer's own node: a surface exported elsewhere could not
+            // be imported. No node reported yet means nothing to decode onto.
+            let node = crate::render_node().ok_or_else(|| {
+                anyhow::anyhow!("no window GPU reported; cannot pick a VA device")
+            })?;
+            let node_c = std::ffi::CString::new(node.to_string_lossy().into_owned())?;
             anyhow::ensure!(
                 (symbols.hwdevice_ctx_create)(
                     &mut decoder.hw_device,
                     AV_HWDEVICE_TYPE_VAAPI,
-                    c"/dev/dri/renderD128".as_ptr(),
+                    node_c.as_ptr(),
                     ptr::null_mut(),
                     0,
                 ) >= 0,
-                "av_hwdevice_ctx_create failed"
+                "av_hwdevice_ctx_create failed on {}",
+                node.display()
             );
             anyhow::ensure!(!decoder.hw_device.is_null(), "no hardware device");
 
@@ -1745,7 +1784,10 @@ mod codec {
             let vaapi = (*device_context).hwctx as *mut AvVaapiDeviceContext;
             anyhow::ensure!(!vaapi.is_null(), "the device has no VA-API context");
             decoder.display = (*vaapi).display;
-            anyhow::ensure!(!decoder.display.is_null(), "the VA-API device has no display");
+            anyhow::ensure!(
+                !decoder.display.is_null(),
+                "the VA-API device has no display"
+            );
 
             let codec = (symbols.find_decoder_by_name)(c"h264".as_ptr());
             anyhow::ensure!(!codec.is_null(), "no h264 decoder");
@@ -2087,6 +2129,10 @@ mod codec {
     /// dimensions; the two chroma samples a pixel needs are shared by a 2x2 block, so the plane is
     /// walked at half the row rate. Scalar, and the fallback for a machine without libswscale, which
     /// [`Sws`] accelerates through and which the parity test below holds this to.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a plane-pair kernel: the two planes, their strides and the geometry are its subject"
+    )]
     fn nv12_to_bgra(
         luma: *const u8,
         luma_stride: c_int,
@@ -2126,11 +2172,14 @@ mod codec {
             let (luma_row, chroma_row) = unsafe {
                 (
                     std::slice::from_raw_parts(luma.add(row * luma_stride as usize), width),
-                    std::slice::from_raw_parts(chroma.add((row / 2) * chroma_stride as usize), width),
+                    std::slice::from_raw_parts(
+                        chroma.add((row / 2) * chroma_stride as usize),
+                        width,
+                    ),
                 )
             };
             let out_row = &mut out[row * width * 4..(row + 1) * width * 4];
-            for (col, pixel) in out_row.chunks_exact_mut(4).enumerate() {
+            for (col, pixel) in out_row.as_chunks_mut::<4>().0.iter_mut().enumerate() {
                 let y = (i32::from(luma_row[col]) * yc - yo) >> 16;
                 let u = i32::from(chroma_row[col & !1]) - 128;
                 let v = i32::from(chroma_row[(col & !1) + 1]) - 128;
@@ -2169,8 +2218,8 @@ mod codec {
         out: &mut [u8],
         sws: Option<&mut Sws>,
     ) {
-        if let Some(sws) = sws {
-            if sws.convert(
+        if let Some(sws) = sws
+            && sws.convert(
                 luma,
                 luma_stride,
                 chroma,
@@ -2181,9 +2230,9 @@ mod codec {
                 dst_height,
                 color_space,
                 out.as_mut_ptr(),
-            ) {
-                return;
-            }
+            )
+        {
+            return;
         }
         if dst_width == width && dst_height == height {
             nv12_to_bgra(
@@ -2274,7 +2323,8 @@ mod codec {
             // alive for the borrow.
             unsafe {
                 let transfer_start = Instant::now();
-                let transferred = (symbols.hwframe_transfer_data)(self.software, frame.frame, 0) >= 0;
+                let transferred =
+                    (symbols.hwframe_transfer_data)(self.software, frame.frame, 0) >= 0;
                 let transfer = transfer_start.elapsed();
                 if !transferred {
                     return None;
@@ -2287,12 +2337,12 @@ mod codec {
                 let chroma_stride = (*self.software).linesize[1];
                 // Scaling is libswscale's alone; without it, the scalar walk converts at the
                 // source size, so the output is the source size too.
-                let (out_width, out_height) = if self.sws.is_some() && dst_width > 0 && dst_height > 0
-                {
-                    (dst_width as usize, dst_height as usize)
-                } else {
-                    (width, height)
-                };
+                let (out_width, out_height) =
+                    if self.sws.is_some() && dst_width > 0 && dst_height > 0 {
+                        (dst_width as usize, dst_height as usize)
+                    } else {
+                        (width, height)
+                    };
                 let len = out_width * out_height * 4;
                 if self.bgra.len() != len {
                     // Sizes it on the first read and whenever the destination changes; later reads
@@ -2360,7 +2410,8 @@ mod codec {
             // alive for the borrow; the staging offsets are within the resized buffer.
             unsafe {
                 let transfer_start = Instant::now();
-                let transferred = (symbols.hwframe_transfer_data)(self.software, frame.frame, 0) >= 0;
+                let transferred =
+                    (symbols.hwframe_transfer_data)(self.software, frame.frame, 0) >= 0;
                 let transfer = transfer_start.elapsed();
                 if !transferred {
                     return None;
@@ -2385,7 +2436,8 @@ mod codec {
                 }
                 if !chroma.is_null() && width > 0 {
                     for row in 0..height / 2 {
-                        let src = std::slice::from_raw_parts(chroma.add(row * chroma_stride), width);
+                        let src =
+                            std::slice::from_raw_parts(chroma.add(row * chroma_stride), width);
                         let at = luma_len + row * width;
                         staging[at..at + width].copy_from_slice(src);
                     }
@@ -2505,7 +2557,10 @@ mod codec {
                 "the video stream index is past the stream table"
             );
             let stream = &**context.streams.add(index as usize);
-            anyhow::ensure!(!stream.codecpar.is_null(), "the video stream has no parameters");
+            anyhow::ensure!(
+                !stream.codecpar.is_null(),
+                "the video stream has no parameters"
+            );
             demuxer.parameters = stream.codecpar;
             demuxer.index = index;
             demuxer.frame_rate = stream.avg_frame_rate;
@@ -2648,7 +2703,7 @@ mod codec {
             use std::ffi::c_int;
 
             use super::super::ffmpeg;
-            use super::{nv12_to_bgra, Sws, SwsSymbols};
+            use super::{Sws, SwsSymbols, nv12_to_bgra};
 
             let Some(libs) = ffmpeg::load() else {
                 eprintln!("skipping: libavcodec/libavutil of the declared ABI is unavailable");
@@ -2835,11 +2890,14 @@ mod va {
         let create_surfaces: CreateSurfaces = unsafe { *va.get(b"vaCreateSurfaces\0")? };
         let destroy_surfaces: DestroySurfaces = unsafe { *va.get(b"vaDestroySurfaces\0")? };
 
-        // The Intel render node, the one the window renderer is steered to as well.
-        let node = std::fs::File::open("/dev/dri/renderD128")?;
+        // The renderer's own render node; a surface exported elsewhere could not be imported.
+        let node_path = crate::render_node()
+            .ok_or_else(|| anyhow::anyhow!("no window GPU reported; cannot pick a VA device"))?;
+        let node = std::fs::File::open(&node_path)
+            .map_err(|error| anyhow::anyhow!("opening {}: {error}", node_path.display()))?;
         let display = get_display(node.as_raw_fd());
         if display.is_null() {
-            anyhow::bail!("no VA display on renderD128");
+            anyhow::bail!("no VA display on {}", node_path.display());
         }
         let mut major = 0;
         let mut minor = 0;
@@ -2938,6 +2996,7 @@ mod tests {
     /// into a tiled NV12 surface, which is what the renderer composites.
     #[test]
     fn the_fixture_decodes_to_a_tiled_surface() {
+        seed_gpu();
         let Some(frame) = decode(FIXTURE) else {
             eprintln!(
                 "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
@@ -2960,6 +3019,7 @@ mod tests {
     /// no surface could be exported. The raw stream and a container both reach a tiled surface.
     #[test]
     fn a_plain_baseline_stream_decodes_in_hardware() {
+        seed_gpu();
         let Some(frame) = decode(BASELINE) else {
             eprintln!(
                 "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
@@ -2985,7 +3045,7 @@ mod tests {
             };
             for _ in 0..3 {
                 let handle = playback
-                    .next()
+                    .next_frame()
                     .unwrap_or_else(|| panic!("a frame from {fixture}"));
                 assert_eq!((handle.width, handle.height), (128, 128), "{fixture}");
                 signal(&handle);
@@ -3000,6 +3060,7 @@ mod tests {
     fn the_decoded_handle_carries_the_streams_colour_space() {
         use gpui_engine::{YuvColorSpace, YuvMatrix, YuvRange};
 
+        seed_gpu();
         let Some(full) = decode(FIXTURE) else {
             eprintln!(
                 "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
@@ -3025,6 +3086,7 @@ mod tests {
     /// all — as a player must, so none is recycled while the renderer samples it — keeps them valid.
     #[test]
     fn a_clip_decodes_to_one_tiled_surface_per_frame() {
+        seed_gpu();
         let Some(mut decoder) = Decoder::open() else {
             eprintln!(
                 "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
@@ -3038,11 +3100,26 @@ mod tests {
         while let Some(frame) = decoder.receive() {
             let handle = frame.handle();
             assert_eq!((handle.width, handle.height), (256, 144));
-            assert_ne!(handle.modifier, DmaBufHandle::LINEAR, "a decoded frame is tiled");
+            assert_ne!(
+                handle.modifier,
+                DmaBufHandle::LINEAR,
+                "a decoded frame is tiled"
+            );
             frames.push(frame);
         }
 
         assert_eq!(frames.len(), 60, "the clip is 60 frames");
+    }
+
+    /// Name a GPU for the producers: a unit test has no window to report the renderer's own, so it
+    /// takes the first device that exports a dma-buf. A real caller reports the window's GPU through
+    /// `Adapter::gpu_id`.
+    fn seed_gpu() {
+        if gpui_interop::gpu_id().is_none()
+            && let Ok(device) = gpui_interop::GpuDevice::open()
+        {
+            gpui_interop::remember(device.gpu_id());
+        }
     }
 
     /// Signal a handle's release descriptor, as the renderer does once it has finished with a frame.
@@ -3067,6 +3144,7 @@ mod tests {
     /// stream — the point of the ring, where holding every frame would pin every surface.
     #[test]
     fn a_playback_keeps_a_bounded_number_of_frames_alive() {
+        seed_gpu();
         let Some(mut playback) = Playback::open(CLIP, 3) else {
             eprintln!(
                 "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
@@ -3076,7 +3154,7 @@ mod tests {
 
         let mut peak = 0;
         for _ in 0..200 {
-            let Some(handle) = playback.next() else {
+            let Some(handle) = playback.next_frame() else {
                 break;
             };
             peak = peak.max(playback.live());
@@ -3096,6 +3174,7 @@ mod tests {
     /// sampling; once the outstanding frames are released it advances again.
     #[test]
     fn a_playback_waits_for_the_release_before_recycling() {
+        seed_gpu();
         let Some(mut playback) = Playback::open(CLIP, 2) else {
             eprintln!(
                 "skipping: libavcodec of the declared ABI, or the VA-API device, is unavailable"
@@ -3106,7 +3185,7 @@ mod tests {
         // Draw a few frames without releasing any: the ring fills and then stalls.
         let mut drawn = Vec::new();
         for _ in 0..4 {
-            drawn.push(playback.next().expect("a frame"));
+            drawn.push(playback.next_frame().expect("a frame"));
         }
         assert_eq!(playback.live(), 2, "the bound holds");
         assert_eq!(playback.position(), 2, "and it stops rather than recycle");
@@ -3115,7 +3194,7 @@ mod tests {
         for handle in &drawn {
             signal(handle);
         }
-        let _ = playback.next();
+        let _ = playback.next_frame();
         assert!(
             playback.position() > 2,
             "releasing lets it advance, at {}",
@@ -3151,6 +3230,7 @@ mod tests {
     fn a_container_plays_through_the_bounded_playback() {
         use gpui_engine::{YuvColorSpace, YuvMatrix, YuvRange};
 
+        seed_gpu();
         let Some(mut playback) = Playback::open_path(Path::new(FIXTURE_MP4), 3) else {
             eprintln!(
                 "skipping: libavformat/libavcodec of the declared ABI, or the VA-API device, is \
@@ -3162,11 +3242,15 @@ mod tests {
         let mut peak = 0;
         let mut first = true;
         for _ in 0..200 {
-            let Some(handle) = playback.next() else {
+            let Some(handle) = playback.next_frame() else {
                 break;
             };
             assert_eq!((handle.width, handle.height), (256, 144));
-            assert_ne!(handle.modifier, DmaBufHandle::LINEAR, "a decoded frame is tiled");
+            assert_ne!(
+                handle.modifier,
+                DmaBufHandle::LINEAR,
+                "a decoded frame is tiled"
+            );
             if first {
                 first = false;
                 // The clip is full-range BT.601, and the colour space is read through the container
@@ -3198,6 +3282,7 @@ mod tests {
     /// one the decoder can only reach by decoding forward from the keyframe before it.
     #[test]
     fn a_seek_decodes_forward_to_the_frame_at_the_target() {
+        seed_gpu();
         let Some(probe) = Demuxer::open(Path::new(FIXTURE_MP4)) else {
             eprintln!("skipping: libavformat of the declared ABI is unavailable");
             return;
@@ -3209,14 +3294,16 @@ mod tests {
             );
             return;
         };
-        let period = playback.frame_period().expect("the clip declares a frame rate");
+        let period = playback
+            .frame_period()
+            .expect("the clip declares a frame rate");
         let period_ts = probe.timestamp_at(period);
 
         for frame in [1u32, 7, 13, 21, 31, 45] {
             let target = period * frame;
             let target_ts = probe.timestamp_at(target);
             assert!(playback.seek(target), "seek to {target:?}");
-            let handle = playback.next().expect("a frame after the seek");
+            let handle = playback.next_frame().expect("a frame after the seek");
             let pts = playback
                 .live
                 .back()

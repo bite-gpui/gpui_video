@@ -100,8 +100,12 @@ mod demo {
                 return bar(x, width);
             }
             if x < width / 2 {
-                if x % 2 == 0 { [255, 0, 0] } else { [0, 0, 255] }
-            } else if x % 2 == 0 {
+                if x.is_multiple_of(2) {
+                    [255, 0, 0]
+                } else {
+                    [0, 0, 255]
+                }
+            } else if x.is_multiple_of(2) {
                 [0, 0, 0]
             } else {
                 [255, 255, 255]
@@ -261,12 +265,8 @@ mod demo {
             );
 
             let selected = self.tab;
-            let tabs = div()
-                .flex()
-                .flex_wrap()
-                .justify_center()
-                .gap_2()
-                .children(formats.iter().enumerate().map(|(index, name)| {
+            let tabs = div().flex().flex_wrap().justify_center().gap_2().children(
+                formats.iter().enumerate().map(|(index, name)| {
                     let active = index == selected;
                     div()
                         .id(("format-tab", index))
@@ -282,7 +282,8 @@ mod demo {
                             this.tab = index;
                             cx.notify();
                         }))
-                }));
+                }),
+            );
 
             div()
                 .size_full()
@@ -384,14 +385,14 @@ mod demo {
         use std::rc::Rc;
         use std::sync::Arc;
 
+        use super::{DECODED_COLOUR, TILE, error_panel, panel, test_card};
         use anyhow::{Context as _, Result};
         use ash::vk;
         use gpui::{
             AnyElement, ChromaReconstruction, Corners, DmaBufHandle, DmaBufPlane,
-            ImportedTextureHandle, ImportedTextureExt as _, SurfaceFormatKind, Window, gpu_canvas,
+            ImportedTextureExt as _, ImportedTextureHandle, SurfaceFormatKind, Window, gpu_canvas,
             prelude::*, surface,
         };
-        use super::{DECODED_COLOUR, TILE, error_panel, panel, test_card};
 
         /// The format dimension: one tab per payload the platform can carry, plus the same NV12
         /// buffer sampled both ways so the chroma reconstruction can be compared, and the one a
@@ -428,9 +429,12 @@ mod demo {
         /// The decoded tab's surface: a real hardware decode of the fixture's bitstream, or — where
         /// libavcodec of the declared ABI is not installed — the GPU-filled stand-in. The payload is
         /// never read: either type is held only so its memory outlives the exported dma-buf.
-        #[allow(dead_code, reason = "held so the surface outlives the dma-buf it exported")]
+        #[allow(
+            dead_code,
+            reason = "held so the surface outlives the dma-buf it exported"
+        )]
         enum DecodedSurface {
-            Decoded(gpui_va::Frame),
+            Decoded(Box<gpui_va::Frame>),
             StandIn(gpui_va::Surface),
         }
 
@@ -505,10 +509,12 @@ mod demo {
                 let (decoded, decoded_handle) = match gpui_va::decode(gpui_va::FIXTURE) {
                     Some(frame) => {
                         let handle = frame.handle().clone();
-                        (Some(DecodedSurface::Decoded(frame)), Some(handle))
+                        (Some(DecodedSurface::Decoded(Box::new(frame))), Some(handle))
                     }
                     None => match gpui_va::nv12(TILE, TILE, DECODED_COLOUR) {
-                        Some((surface, handle)) => (Some(DecodedSurface::StandIn(surface)), Some(handle)),
+                        Some((surface, handle)) => {
+                            (Some(DecodedSurface::StandIn(surface)), Some(handle))
+                        }
                         None => (None, None),
                     },
                 };
@@ -593,14 +599,16 @@ mod demo {
                     Ok(producer) => *slot = Some(producer),
                     Err(error) => {
                         log::error!("surface: cannot produce a dma-buf: {error:#}");
-                        return vec![error_panel(format!("dma-buf producer unavailable: {error:#}"))];
+                        return vec![error_panel(format!(
+                            "dma-buf producer unavailable: {error:#}"
+                        ))];
                     }
                 }
             }
             let producer = slot.as_ref().expect("the producer was just built");
 
             match format {
-                0 | 1 | 2 | 3 => {
+                0..=3 => {
                     let (handle, surface_caption, canvas_caption) = match format {
                         0 => (
                             producer.bgra.clone(),
@@ -733,13 +741,15 @@ mod demo {
                     .iter()
                     .copied()
                     .find(|device| {
-                        let properties = unsafe { instance.get_physical_device_properties(*device) };
+                        let properties =
+                            unsafe { instance.get_physical_device_properties(*device) };
                         properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
                     })
                     .or_else(|| devices.first().copied())
                     .context("no Vulkan device for the producer")?;
 
-                let properties = unsafe { instance.get_physical_device_memory_properties(physical) };
+                let properties =
+                    unsafe { instance.get_physical_device_memory_properties(physical) };
                 let memory_type_index = properties
                     .memory_types
                     .iter()
@@ -795,10 +805,10 @@ mod demo {
                 .context("allocate the producer buffer")?;
 
                 unsafe {
-                    let mapped = self
-                        .device
-                        .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-                        .context("map the producer buffer")? as *mut u8;
+                    let mapped =
+                        self.device
+                            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
+                            .context("map the producer buffer")? as *mut u8;
                     std::ptr::copy_nonoverlapping(content.as_ptr(), mapped, content.len());
                     self.device.unmap_memory(memory);
                 }
@@ -839,23 +849,25 @@ mod demo {
             AnyElement, DirectXRenderer, DirectXSource, GpuCanvasContext, SharedDirectXFence,
             SharedDirectXSurface, SurfaceSource, Window, gpu_canvas, prelude::*, surface,
         };
-        use windows::core::{Interface as _, PCWSTR};
         use windows::Win32::Foundation::{HANDLE, HMODULE};
         use windows::Win32::Graphics::Direct3D::{
             D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL_11_0, D3D_SRV_DIMENSION_TEXTURE2D,
         };
         use windows::Win32::Graphics::Direct3D11::{
             D3D11_BIND_SHADER_RESOURCE, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_FENCE_FLAG_SHARED,
-            D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION, D3D11_SHADER_RESOURCE_VIEW_DESC,
-            D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV, D3D11_TEXTURE2D_DESC,
-            D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device, ID3D11Device5,
-            ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence, ID3D11Resource,
+            D3D11_RESOURCE_MISC_SHARED_NTHANDLE, D3D11_SDK_VERSION,
+            D3D11_SHADER_RESOURCE_VIEW_DESC, D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV,
+            D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11CreateDevice, ID3D11Device,
+            ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext4, ID3D11Fence, ID3D11Resource,
             ID3D11ShaderResourceView, ID3D11Texture2D,
+        };
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
         };
         use windows::Win32::Graphics::Dxgi::{
             DXGI_SHARED_RESOURCE_READ, DXGI_SHARED_RESOURCE_WRITE, IDXGIResource1,
         };
-        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+        use windows::core::{Interface as _, PCWSTR};
 
         use super::{TILE, error_panel, panel, test_card};
 
@@ -932,7 +944,8 @@ mod demo {
                     )
                 }
                 .context("creating the shared producer's Direct3D 11 device")?;
-                let device: ID3D11Device = device.context("D3D11CreateDevice returned no device")?;
+                let device: ID3D11Device =
+                    device.context("D3D11CreateDevice returned no device")?;
                 let context: ID3D11DeviceContext =
                     context.context("D3D11CreateDevice returned no context")?;
 
@@ -1211,8 +1224,8 @@ mod demo {
         use core_foundation::dictionary::CFDictionary;
         use core_foundation::string::CFString;
         use core_video::pixel_buffer::{
-            CVPixelBuffer, kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferMetalCompatibilityKey,
-            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            CVPixelBuffer, kCVPixelBufferIOSurfacePropertiesKey,
+            kCVPixelBufferMetalCompatibilityKey, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         };
         use gpui::{
             AnyElement, Corners, ImportedTextureHandle, SurfaceSource, Window, gpu_canvas,
@@ -1423,12 +1436,13 @@ mod demo {
                 memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
                 display: None,
             });
-            let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: None,
-                force_fallback_adapter: false,
-            }))
-            .map_err(|error| anyhow::anyhow!("no Metal adapter: {error}"))?;
+            let adapter =
+                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::LowPower,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                }))
+                .map_err(|error| anyhow::anyhow!("no Metal adapter: {error}"))?;
             let (device, queue) =
                 pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                     label: Some("surface_showcase"),

@@ -108,7 +108,7 @@ fn decode(path: &Path, frames: u32) -> Option<(Duration, (u32, u32))> {
     while demuxer.send_next(&mut decoder).ok()? {
         while let Some(frame) = decoder.receive() {
             let handle = frame.handle();
-            size = (handle.width as u32, handle.height as u32);
+            size = (handle.width, handle.height);
             decoded += 1;
             if decoded >= frames {
                 return Some((start.elapsed(), size));

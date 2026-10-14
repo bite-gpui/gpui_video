@@ -134,7 +134,8 @@ fn produce_dmabuf(content: &[u8]) -> Option<(Producer, OwnedFd)> {
             )
         }?;
         unsafe {
-            let mapped = device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
+            let mapped =
+                device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
             std::ptr::copy_nonoverlapping(content.as_ptr(), mapped, content.len());
             device.unmap_memory(memory);
         }
@@ -303,7 +304,17 @@ fn composite_canvas(colour: [u8; 4]) -> anyhow::Result<Option<[u8; 4]>> {
 /// The renderer the platform builds for a headless context; `None` where there is no adapter, which
 /// is a skip rather than a failure.
 fn gpu_available() -> bool {
-    gpui::current_headless_renderer().is_some()
+    if gpui::current_headless_renderer().is_none() {
+        return false;
+    }
+    // A test has no window to report the renderer's GPU, so name the first device that exports a
+    // dma-buf; the module docs' `ZED_DEVICE_ID` pin lands the renderer there too, so the two agree.
+    if gpui_interop::gpu_id().is_none()
+        && let Ok(device) = gpui_interop::GpuDevice::open()
+    {
+        gpui_interop::remember(device.gpu_id());
+    }
+    true
 }
 
 #[test]
@@ -382,7 +393,10 @@ fn the_renderer_signals_a_surfaces_release_descriptor() {
         revents: 0,
     };
     let ready = unsafe { libc::poll(&mut descriptor, 1, 5000) };
-    assert_eq!(ready, 1, "the renderer should signal the release descriptor");
+    assert_eq!(
+        ready, 1,
+        "the renderer should signal the release descriptor"
+    );
 }
 
 #[test]
@@ -457,7 +471,7 @@ fn an_nv12_surface_converts_through_the_shader() {
     // interleaved chroma, carrying the bytes the BT.601 conversion maps back to olive.
     let (y, cb, cr) = nv12_from_rgb(COLOUR);
     let mut content = vec![y; luma_size + chroma_size];
-    for pair in content[luma_size..].chunks_exact_mut(2) {
+    for pair in content[luma_size..].as_chunks_mut::<2>().0 {
         pair[0] = cb;
         pair[1] = cr;
     }
@@ -480,8 +494,11 @@ fn an_nv12_surface_converts_through_the_shader() {
 
     let pixel = composite(handle).expect("composite the surface");
     // The same BT.601 matrix the shader applies, on the CPU, to the bytes the planes carry.
-    let expected =
-        ycbcr_to_rgb(f32::from(y) / 255.0, f32::from(cb) / 255.0, f32::from(cr) / 255.0);
+    let expected = ycbcr_to_rgb(
+        f32::from(y) / 255.0,
+        f32::from(cb) / 255.0,
+        f32::from(cr) / 255.0,
+    );
     for channel in 0..3 {
         let want = (expected[channel] * 255.0).round() as i32;
         let got = i32::from(pixel[channel]);
@@ -515,8 +532,11 @@ fn a_tiled_nv12_surface_imports_under_its_modifier_and_converts() {
 
     let pixel = composite(handle).expect("composite the tiled surface");
     let (y, cb, cr) = nv12_from_rgb(COLOUR);
-    let expected =
-        ycbcr_to_rgb(f32::from(y) / 255.0, f32::from(cb) / 255.0, f32::from(cr) / 255.0);
+    let expected = ycbcr_to_rgb(
+        f32::from(y) / 255.0,
+        f32::from(cb) / 255.0,
+        f32::from(cr) / 255.0,
+    );
     for channel in 0..3 {
         let want = (expected[channel] * 255.0).round() as i32;
         let got = i32::from(pixel[channel]);
@@ -610,7 +630,11 @@ fn a_decoded_h264_surface_composites_through_the_shader() {
         let x = (2 * bar as u32 + 1) * width / (2 * SMPTE_BARS.len() as u32);
         let got = pixels[(height / 2 * width + x) as usize];
         let (y, cb, cr) = nv12_from_rgb(*rgb);
-        let want = ycbcr_to_rgb(f32::from(y) / 255.0, f32::from(cb) / 255.0, f32::from(cr) / 255.0);
+        let want = ycbcr_to_rgb(
+            f32::from(y) / 255.0,
+            f32::from(cb) / 255.0,
+            f32::from(cr) / 255.0,
+        );
         for channel in 0..3 {
             let want = (want[channel] * 255.0).round() as i32;
             let got = i32::from(got[channel]);
@@ -669,9 +693,10 @@ fn a_limited_surface_declared_as_full_range_is_not_the_bars() {
         .clone()
         .with_color_space(gpui_engine::YuvColorSpace::default());
     let got = composite_bar_centers(handle);
-    let off = SMPTE_BARS.iter().zip(&got).any(|(rgb, got)| {
-        (0..3usize).any(|c| i32::from(got[c]).abs_diff(i32::from(rgb[c])) > 6)
-    });
+    let off = SMPTE_BARS
+        .iter()
+        .zip(&got)
+        .any(|(rgb, got)| (0..3usize).any(|c| i32::from(got[c]).abs_diff(i32::from(rgb[c])) > 6));
     assert!(
         off,
         "reading limited bytes as full range must change the colour, but got {got:?}",
@@ -783,11 +808,14 @@ fn a_bounded_playback_plays_through_the_renderer() {
     });
     let view_handle = handle.clone();
     let window = cx
-        .open_window(size(px(WIDTH as f32), px(HEIGHT as f32)), move |_window, cx| {
-            cx.new(|_| PlaybackSurfaceView {
-                handle: view_handle,
-            })
-        })
+        .open_window(
+            size(px(WIDTH as f32), px(HEIGHT as f32)),
+            move |_window, cx| {
+                cx.new(|_| PlaybackSurfaceView {
+                    handle: view_handle,
+                })
+            },
+        )
         .expect("a window");
     let window: AnyWindowHandle = window.into();
 
@@ -800,7 +828,7 @@ fn a_bounded_playback_plays_through_the_renderer() {
         })
         .expect("draw a frame");
         let _ = cx.capture_screenshot(window).expect("capture the frame");
-        *handle.borrow_mut() = playback.next();
+        *handle.borrow_mut() = playback.next_frame();
         if playback.position() > 12 {
             break;
         }

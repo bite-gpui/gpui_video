@@ -28,6 +28,10 @@ gpui_va = { version = "0.1.0", path = "crates/gpui_va" }
 gpui_video = { version = "0.1.0", path = "crates/gpui_video" }
 gpui_video_platform = { version = "0.1.0", path = "crates/gpui_video_platform" }
 
+# The producer-side surface crate: a `gpui_va` decoder lands on the window renderer's GPU through
+# it. Development takes it from the sibling checkout; on release it becomes its published version.
+gpui_interop = { version = "0.1.0", path = "../gpui-interop/crates/gpui_interop" }
+
 # The core this stack is built on. Development takes it from its branch; on release each `git` and
 # `branch` pair is replaced by the core's published `version = "1.23"`, which a published crate has
 # to depend on instead of a git source.

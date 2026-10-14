@@ -2200,6 +2200,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpui_interop"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ash",
+ "embed-resource",
+ "gpui_engine",
+ "log",
+ "wgpu",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "gpui_linux"
 version = "0.1.0"
 source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
@@ -2402,6 +2415,7 @@ dependencies = [
  "foreign-types",
  "gpui",
  "gpui_engine",
+ "gpui_interop",
  "gpui_video_platform",
  "gpui_wgpu",
  "libc",
@@ -2420,8 +2434,10 @@ dependencies = [
  "flume",
  "gpui",
  "gpui_authoring",
+ "gpui_interop",
  "gpui_va",
  "gpui_video_platform",
+ "gpui_wgpu",
  "image",
  "libc",
  "smallvec",

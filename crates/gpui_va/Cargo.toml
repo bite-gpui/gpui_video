@@ -22,6 +22,9 @@ test-support = []
 [target.'cfg(target_os = "linux")'.dependencies]
 anyhow.workspace = true
 gpui_engine.workspace = true
+# The GPU match: this names the window renderer's DRM node, so a surface is exported on the GPU the
+# renderer will sample it on rather than a node picked by hand.
+gpui_interop.workspace = true
 # The platform seam the surface path is fed through, so a Linux playback and a macOS decoder reach
 # the same element. `gpui_video_platform` depends only on the engine.
 gpui_video_platform.workspace = true
