@@ -39,6 +39,8 @@ use gpui_authoring::{
     AnyElement, App, AppContext as _, ElementId, Entity, EntityId, IntoElement, ObjectFit,
     ParentElement, StyleRefinement, Styled, SurfaceSource, View, ViewElement, Window, div, surface,
 };
+#[cfg(target_os = "linux")]
+use gpui_authoring::{GpuCanvasContext, gpu_canvas};
 use gpui_video_platform::SurfaceProducer;
 
 mod controls;
@@ -286,11 +288,21 @@ impl View for Video {
 
         let wants_default_controls = matches!(controls, Some(Controls::Default));
 
-        let (source, default_bar) = match frames {
-            Frames::None => (None, None),
-            Frames::External(mut read) => (read(cx), default_controls.map(|build| build())),
-            Frames::Owned(open) => (owned_source(window, id, open), None),
-            Frames::Source(source) => owned_player(window, cx, id, source, wants_default_controls),
+        let (source, default_bar) = if gpu_reported() {
+            match frames {
+                Frames::None => (None, None),
+                Frames::External(mut read) => (read(cx), default_controls.map(|build| build())),
+                Frames::Owned(open) => (owned_source(window, id, open), None),
+                Frames::Source(source) => {
+                    owned_player(window, cx, id, source, wants_default_controls)
+                }
+            }
+        } else {
+            // A producer cannot export a surface until the renderer's GPU is reported, so nothing is
+            // produced yet; the frame painted below reports it, and the animation frame asked for
+            // brings the next one, which opens the producer.
+            window.request_animation_frame();
+            (None, None)
         };
 
         let overlay = match overlay {
@@ -346,9 +358,41 @@ fn frame_element(
     object_fit: ObjectFit,
     style: Option<StyleRefinement>,
 ) -> AnyElement {
+    #[cfg(target_os = "linux")]
+    if !gpu_reported() {
+        // The renderer's device is reachable only from a `gpu_canvas`, so one paint there reports the
+        // GPU every producer must export on. Until it has there is nothing to decode, so the frame
+        // paints the reporting canvas and keeps its place.
+        return sized(gpu_canvas(report_renderer_gpu), style);
+    }
     match source {
         Some(source) => sized(surface(source).object_fit(object_fit), style),
         None => sized(div(), style),
+    }
+}
+
+/// Whether the renderer's GPU has been reported, so a producer can export a surface on it. True
+/// everywhere but Linux, where a dma-buf is importable only on the renderer's own GPU.
+#[cfg(target_os = "linux")]
+fn gpu_reported() -> bool {
+    gpui_interop::gpu_id().is_some()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn gpu_reported() -> bool {
+    true
+}
+
+/// Report the GPU the window draws on, so a producer that runs off the paint can export on it. The
+/// device is reachable only from a `gpu_canvas`, and `WgpuRenderer` is the backend a Linux window
+/// draws through.
+#[cfg(target_os = "linux")]
+fn report_renderer_gpu(gpu: &mut GpuCanvasContext) {
+    if let Some(id) = gpui_interop::attach(gpu.try_device::<gpui_wgpu::WgpuRenderer>())
+        .ok()
+        .and_then(|interop| interop.adapter().gpu_id())
+    {
+        gpui_interop::remember(id);
     }
 }
 
@@ -390,8 +434,8 @@ fn owned_player(
             }
 
             let surface = player.update(cx, |player, _| player.surface());
-            let bar = wants_default_controls
-                .then(|| video_controls(player.clone()).into_any_element());
+            let bar =
+                wants_default_controls.then(|| video_controls(player.clone()).into_any_element());
             ((surface, bar), player)
         })
     })

@@ -28,6 +28,10 @@ flume.workspace = true
 # so only the one that exists for a target is a dependency.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_va.workspace = true
+# The GPU match: a dma-buf is importable only on the renderer's own GPU, and the renderer's device is
+# reachable only from a `gpu_canvas`, whose device is typed by the backend's renderer.
+gpui_wgpu.workspace = true
+gpui_interop = { workspace = true, features = ["wgpu"] }
 
 [dev-dependencies]
 # The examples open a real window, so they need the facade with a platform backend — `gpui` is
