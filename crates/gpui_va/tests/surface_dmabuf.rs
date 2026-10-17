@@ -57,17 +57,31 @@ const COLOUR: [u8; 4] = [128, 128, 0, 255];
 /// `COLOUR` in the byte order a `Bgra8` buffer stores: blue, green, red, alpha.
 const BGRA_COLOUR: [u8; 4] = [COLOUR[2], COLOUR[1], COLOUR[0], COLOUR[3]];
 
+/// The headless renderer, pinned to `ZED_DEVICE_ID` when it is set.
+///
+/// The library deliberately reads no environment variable: it sees only a `GpuPreference`. A test
+/// that must run on a named GPU translates the variable here, into the same preference an
+/// application would state.
+fn headless_renderer() -> anyhow::Result<Option<Box<dyn gpui::SceneRenderer>>> {
+    let preference = std::env::var("ZED_DEVICE_ID")
+        .ok()
+        .and_then(|value| gpui::GpuId::parse_pci_id(&value))
+        .map(|device_id| gpui::GpuPreference::Device(gpui::GpuId::by_device(device_id)))
+        .unwrap_or(gpui::GpuPreference::Auto);
+    gpui::current_headless_renderer_with(preference)
+}
+
 /// Borrow the renderer's own device, on the GPU this process draws its headless frames through.
 ///
 /// A dma-buf is importable only on the GPU it was exported from, and the renderer's device is reachable
 /// only from a `gpu_canvas` callback, so this opens a throwaway headless window, paints one frame to
 /// run a canvas, and lifts the device back out. It stays valid after that context drops:
-/// `WgpuContext::new_headless` caches the context in a process-wide static, so the instance the device
+/// The headless context is cached in a process-wide static, so the instance the device
 /// was made from is never torn down for the life of the process.
 fn renderer_device() -> Option<GpuDevice> {
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        gpui::current_headless_renderer()
+        headless_renderer()
     });
 
     let device: Rc<RefCell<Option<GpuDevice>>> = Rc::new(RefCell::new(None));
@@ -171,7 +185,7 @@ impl Render for SurfaceView {
 fn composite(handle: DmaBufHandle) -> anyhow::Result<[u8; 4]> {
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        gpui::current_headless_renderer()
+        headless_renderer()
     });
 
     let window = cx.open_window(size(px(WIDTH as f32), px(HEIGHT as f32)), |_window, cx| {
@@ -216,7 +230,7 @@ impl Render for EmptyView {
 fn empty_window_pixel() -> anyhow::Result<[u8; 4]> {
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        gpui::current_headless_renderer()
+        headless_renderer()
     });
 
     let window = cx.open_window(size(px(WIDTH as f32), px(HEIGHT as f32)), |_window, cx| {
@@ -317,7 +331,7 @@ fn imported_texture(
 fn composite_canvas(colour: [u8; 4]) -> anyhow::Result<Option<[u8; 4]>> {
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        gpui::current_headless_renderer()
+        headless_renderer()
     });
 
     let painted = Rc::new(Cell::new(false));
@@ -345,7 +359,7 @@ fn composite_canvas(colour: [u8; 4]) -> anyhow::Result<Option<[u8; 4]>> {
 /// a skip rather than a failure. The device a producer exports on is reached later, from a canvas, by
 /// [`renderer_device`]; this only gates whether it is worth painting one.
 fn gpu_available() -> bool {
-    gpui::current_headless_renderer().is_ok_and(|renderer| renderer.is_some())
+    headless_renderer().is_ok_and(|renderer| renderer.is_some())
 }
 
 #[test]
@@ -755,7 +769,7 @@ fn a_tiled_nv12_surface_imports_under_its_modifier_and_converts() {
 fn composite_pixels(handle: DmaBufHandle) -> (u32, u32, Vec<[u8; 4]>) {
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        gpui::current_headless_renderer()
+        headless_renderer()
     });
     let window = cx
         .open_window(size(px(WIDTH as f32), px(HEIGHT as f32)), |_window, cx| {
@@ -1006,7 +1020,7 @@ fn a_bounded_playback_plays_through_the_renderer() {
     let handle: Rc<RefCell<Option<DmaBufHandle>>> = Rc::new(RefCell::new(None));
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        gpui::current_headless_renderer()
+        headless_renderer()
     });
     let view_handle = handle.clone();
     let window = cx
