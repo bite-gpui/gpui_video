@@ -12,10 +12,16 @@
 //! cargo run -p gpui_video --example grid                              # 16x16, the bundled clip, zero-copy
 //! cargo run -p gpui_video --example grid -- --readback               # start in readback mode
 //! cargo run -p gpui_video --example grid -- --cols 4 --rows 4         # a 4x4 wall
+//! cargo run -p gpui_video --features morphorm --example grid -- --morphorm   # swap in the morphorm layout engine
 //! cargo run -p gpui_video --example grid -- --size 1920x1080          # a fixed window the grid fills
 //! cargo run -p gpui_video --example grid -- movie.mp4                 # stages of `movie.mp4`
 //! cargo run -p gpui_video --example grid -- a.mp4 b.mp4               # mix sources across the panes
 //! ```
+//!
+//! A relative source path is taken from the **workspace root**, not from wherever `cargo` was
+//! invoked, so the same argument names the same file from any directory. An absolute path is used as
+//! given. Set `RUST_LOG=warn` to have the libraries' own diagnostics (why a source would not open)
+//! printed instead of dropped.
 //!
 //! The header's "panes" figures are the *worker* side: decode plus the handover, summed across panes,
 //! as a fraction of a core. The readback path additionally uploads each frame on the UI thread, which
@@ -47,19 +53,23 @@
 //! into either; on an integrated part it is system memory the GPU has reserved, not a separate pool.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Bounds, Context, FramePipelineExt, ImageSource, IntoElement, ObjectFit,
-    ParentElement, PhaseMetrics, Render, RenderImage, StatefulInteractiveElement,
+    AnyElement, App, Bounds, Context, FramePipelineExt, GpuCanvasContext, ImageSource, IntoElement,
+    ObjectFit, ParentElement, PhaseMetrics, Render, RenderImage, StatefulInteractiveElement,
     StandardImmediatePipeline, Styled, SurfaceSource, Window, WindowBounds, WindowOptions, div,
-    img, prelude::*, px, rgb, rgba, size, surface,
+    gpu_canvas, img, prelude::*, px, rgb, rgba, size, surface,
 };
+use gpui_interop::{attach, gpu_id, remember};
+#[cfg(feature = "morphorm")]
+use gpui_morphorm::MorphormLayoutEngine;
 use gpui_video_platform::SurfaceProducer;
+use gpui_wgpu::WgpuRenderer;
 
 use gpui_va::{Demuxer, Playback};
 
@@ -334,6 +344,9 @@ struct Grid {
     autoflip: Option<f64>,
     started: Instant,
     flips: u32,
+    /// Whether the panes' workers have been started. They wait for the first paint to report the
+    /// renderer's GPU, since a decoder must be opened on the device the window draws through.
+    started_panes: bool,
 }
 
 /// The header's figures, kept between renders.
@@ -371,9 +384,8 @@ impl Grid {
         mode: Mode,
         scale: f32,
         phases: Rc<RefCell<PhaseMetrics>>,
-        cx: &mut Context<Self>,
     ) -> Self {
-        let mut grid = Self {
+        Self {
             panes: Vec::new(),
             generation: 0,
             sources,
@@ -402,9 +414,8 @@ impl Grid {
             autoflip: std::env::var("GPUI_GRID_AUTOFLIP").ok().and_then(|v| v.parse().ok()),
             started: Instant::now(),
             flips: 0,
-        };
-        grid.start_panes(cx);
-        grid
+            started_panes: false,
+        }
     }
 
     /// Start one worker and one drain task per pane. Pane `i` runs `sources[i % n]` from a fraction
@@ -644,6 +655,20 @@ impl Grid {
 
 impl Render for Grid {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A producer's surface is importable only on the GPU the window draws through, and that
+        // device is reachable only from a `gpu_canvas`. So paint one reporting canvas first and start
+        // no pane until it has: `gpui_va` has no fallback and refuses a device chosen by hand, so
+        // without this every pane's `Playback::open_path` fails with "no window GPU reported".
+        if !gpu_reported() {
+            cx.notify();
+            // The reporting paint is this frame's; ask for the next so the panes can start on it.
+            window.request_animation_frame();
+            return gpu_canvas(report_renderer_gpu).size_full().into_any_element();
+        }
+        if !self.started_panes {
+            self.started_panes = true;
+            self.start_panes(cx);
+        }
         // Release the atlas tiles of the readback images the panes have replaced, so the atlas does
         // not grow with every frame.
         for image in std::mem::take(&mut self.replaced) {
@@ -766,6 +791,24 @@ impl Render for Grid {
                     .children(rows),
             )
             .child(overlay)
+            .into_any_element()
+    }
+}
+
+/// Whether the window's renderer has reported the GPU a producer must export on. `None` until a
+/// `gpu_canvas` has painted, which is why the grid paints one before it starts any pane.
+fn gpu_reported() -> bool {
+    gpu_id().is_some()
+}
+
+/// Report the renderer's GPU, so `gpui_va` can pick the VA device the window draws through — the
+/// device is reachable only from the canvas, so this is the one place it can be learned.
+fn report_renderer_gpu(gpu: &mut GpuCanvasContext) {
+    if let Some(id) = attach(gpu.try_device::<WgpuRenderer>())
+        .ok()
+        .and_then(|interop| interop.adapter().gpu_id())
+    {
+        remember(id);
     }
 }
 
@@ -866,7 +909,7 @@ fn surface_worker(
     metrics: Arc<Metrics>,
 ) {
     let Some(mut playback) = Playback::open_path(&path, DEPTH) else {
-        eprintln!("grid: cannot open {}", path.display());
+        eprintln!("grid: {}", open_failure(&path));
         return;
     };
     start_at(playback.duration(), frac).map(|at| playback.seek(at));
@@ -936,7 +979,7 @@ fn readback_worker(
     fit: Option<(f32, f32)>,
 ) {
     let Some(mut demuxer) = Demuxer::open(&path) else {
-        eprintln!("grid: cannot open {}", path.display());
+        eprintln!("grid: {}", open_failure(&path));
         return;
     };
     let Some(mut decoder) = demuxer.decoder() else {
@@ -1108,9 +1151,77 @@ fn parse_size(value: &str) -> Option<(f32, f32)> {
     Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
 }
 
+/// The base a *relative* source path is taken from: the workspace root, not the directory `cargo` was
+/// invoked from. `CARGO_MANIFEST_DIR` is this crate (`crates/gpui_video`), so the root is its
+/// grandparent; an absolute argument comes back unchanged, since `Path::join` keeps it.
+fn resolve_source(arg: &str) -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the crate sits two levels below the workspace root");
+    root.join(arg)
+}
+
+/// Why a source could not be opened, in terms the reader can act on.
+///
+/// `Playback::open_path` and `Demuxer::open` answer `None` for several different reasons, so the
+/// message has to separate the two that matter: a path that does not resolve, and a decode stack that
+/// is missing. Whether the file is there is the one thing this side can check.
+fn open_failure(path: &Path) -> String {
+    if !path.exists() {
+        return format!(
+            "no such file: {} — a relative path is taken from the workspace root, not the directory \
+             this was run from",
+            path.display()
+        );
+    }
+    format!(
+        "cannot open {} — the file is there, so the decode stack is at fault: the ffmpeg 8.0 \
+         libraries `gpui_va` loads (libavformat/libavcodec/libavutil 62/62/60), the VA-API device \
+         (`/dev/dri/renderD*`), or a stream carrying no video (set `RUST_LOG=warn` for the reason)",
+        path.display()
+    )
+}
+
+/// Prints the `log` records the libraries emit, which are otherwise dropped: without a logger,
+/// `gpui_va`'s reason for refusing a source (`opening the decoder: …`, `opening a container: …`) never
+/// reaches the terminal. Off unless `RUST_LOG` is set, so the example's own output is unchanged; a
+/// value of `debug` or `trace` widens what is shown.
+fn install_logger_if_requested() {
+    struct Stderr;
+
+    impl log::Log for Stderr {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::max_level()
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                eprintln!("[{}] {}", record.level(), record.args());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    let level = match std::env::var("RUST_LOG").ok().as_deref() {
+        None => return,
+        Some(value) if value.contains("trace") => log::LevelFilter::Trace,
+        Some(value) if value.contains("debug") => log::LevelFilter::Debug,
+        Some(value) if value.contains("info") => log::LevelFilter::Info,
+        Some(value) if value.contains("error") => log::LevelFilter::Error,
+        Some(_) => log::LevelFilter::Warn,
+    };
+    let _ = log::set_boxed_logger(Box::new(Stderr));
+    log::set_max_level(level);
+}
+
 fn main() {
+    install_logger_if_requested();
     let mut sources: Vec<PathBuf> = Vec::new();
     let mut mode = Mode::Surface;
+    #[cfg(feature = "morphorm")]
+    let mut morphorm = false;
     let mut cols = 16usize;
     let mut rows = 16usize;
     let mut window = (WINDOW_W, WINDOW_H);
@@ -1118,6 +1229,21 @@ fn main() {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--readback" => mode = Mode::Readback,
+            // Swap GPUI's bundled layout engine for the morphorm-backed one, to weigh the layout pass
+            // against the rest of the frame. On by request, off by default — and only compiled in
+            // behind the `morphorm` feature, since the published swap cannot share a graph with a
+            // working-tree core.
+            "--morphorm" => {
+                #[cfg(feature = "morphorm")]
+                {
+                    morphorm = true;
+                }
+                #[cfg(not(feature = "morphorm"))]
+                eprintln!(
+                    "grid: this build has no morphorm layout engine; rebuild with \
+                     `--features gpui_video/morphorm`"
+                );
+            }
             "--cols" => cols = args.next().and_then(|n| n.parse().ok()).unwrap_or(cols),
             "--rows" => rows = args.next().and_then(|n| n.parse().ok()).unwrap_or(rows),
             "--size" => {
@@ -1125,7 +1251,9 @@ fn main() {
                     window = (w, h);
                 }
             }
-            path => sources.push(PathBuf::from(path)),
+            // Relative to the workspace root, so the same argument names the same file wherever this
+            // is run from; an absolute path is used as given.
+            path => sources.push(resolve_source(path)),
         }
     }
     cols = cols.max(1);
@@ -1145,7 +1273,17 @@ fn main() {
     let pipeline_phases = phases.clone();
     let grid_sources = sources.clone();
 
-    gpui::application()
+    let application = gpui::application();
+    #[cfg(feature = "morphorm")]
+    let application = if morphorm {
+        // The whole application's layout engine, swapped for the morphorm-backed one. The grid's panes
+        // are fixed-size and nothing is measured per pane, so this is where the layout pass's cost can
+        // be weighed against the rest of the frame.
+        application.with_layout_engine(|| Box::new(MorphormLayoutEngine::new()))
+    } else {
+        application
+    };
+    application
         .with_frame_pipeline(move |_| {
             Box::new(StandardImmediatePipeline.instrumented(pipeline_phases.clone()))
         })
@@ -1159,7 +1297,7 @@ fn main() {
                 },
                 move |window, cx| {
                     let scale = window.scale_factor();
-                    cx.new(|cx| {
+                    cx.new(|_| {
                         Grid::new(
                             grid_sources.clone(),
                             cols,
@@ -1168,7 +1306,6 @@ fn main() {
                             mode,
                             scale,
                             phases.clone(),
-                            cx,
                         )
                     })
                 },

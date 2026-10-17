@@ -2,6 +2,7 @@
 //!
 //! ```sh
 //! cargo run -p gpui_va --example surface
+//! cargo run -p gpui_va --example surface -- --tab 2   # open on a given format tab
 //! ```
 //!
 //! The window is a labelled grid of solid olive-green tiles. Each tile is one combination of an
@@ -35,9 +36,9 @@
 //! conversion maps back to that green, and that conversion is worked out and commented where the
 //! bytes are made.
 //!
-//! The producers are the platform's own: a bare Vulkan device exports the Linux dma-bufs, and the
-//! window's device (or one the platform hands every creator) backs the textures. This is a working
-//! application, not a sketch.
+//! The producers are the platform's own: on Linux the renderer's own device — borrowed through
+//! `gpui_interop` — exports the dma-bufs, and the window's device backs the textures. This is a
+//! working application, not a sketch.
 
 #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
 fn main() {
@@ -49,7 +50,42 @@ fn main() {
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn main() {
+    install_logger_if_requested();
     demo::run();
+}
+
+/// Prints the `log` records the libraries emit, which are otherwise dropped — most importantly the
+/// renderer's reason for *dropping a dma-buf surface*, which it logs at `warn` and which would
+/// otherwise leave a tile simply blank. Off unless `RUST_LOG` is set, so the example's own output is
+/// unchanged; a value of `debug` or `trace` widens what is shown.
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+fn install_logger_if_requested() {
+    struct Stderr;
+
+    impl log::Log for Stderr {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::max_level()
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                eprintln!("[{}] {}", record.level(), record.args());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    let level = match std::env::var("RUST_LOG").ok().as_deref() {
+        None => return,
+        Some(value) if value.contains("trace") => log::LevelFilter::Trace,
+        Some(value) if value.contains("debug") => log::LevelFilter::Debug,
+        Some(value) if value.contains("info") => log::LevelFilter::Info,
+        Some(value) if value.contains("error") => log::LevelFilter::Error,
+        Some(_) => log::LevelFilter::Warn,
+    };
+    let _ = log::set_boxed_logger(Box::new(Stderr));
+    log::set_max_level(level);
 }
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
@@ -186,12 +222,24 @@ mod demo {
             ]
         }
 
-        /// The card as one NV12 buffer: the luma plane, then the chroma plane.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        pub fn nv12(width: u32) -> Vec<u8> {
-            let mut bytes = luma(width);
-            bytes.extend_from_slice(&chroma(width));
-            bytes
+        /// Write the card's full-resolution luma plane into `dst`, starting at `offset`, `pitch`
+        /// bytes per row.
+        #[cfg(target_os = "linux")]
+        pub fn write_luma(dst: &mut [u8], width: u32, offset: usize, pitch: usize) {
+            let row = width as usize;
+            for (index, line) in luma(width).chunks(row).enumerate() {
+                dst[offset + index * pitch..][..row].copy_from_slice(line);
+            }
+        }
+
+        /// Write the card's half-resolution interleaved chroma plane into `dst`, at `offset`, `pitch`
+        /// bytes per row.
+        #[cfg(target_os = "linux")]
+        pub fn write_chroma(dst: &mut [u8], width: u32, offset: usize, pitch: usize) {
+            let row = width as usize;
+            for (index, line) in chroma(width).chunks(row).enumerate() {
+                dst[offset + index * pitch..][..row].copy_from_slice(&line[..row]);
+            }
         }
 
         /// An sRGB triple widened to the RGBA the conversion takes.
@@ -239,8 +287,17 @@ mod demo {
 
     impl Showcase {
         fn new() -> Self {
+            // `--tab N` opens on a given format tab, so one payload can be checked without a click.
+            let mut tab = 0;
+            let mut args = std::env::args().skip(1);
+            while let Some(arg) = args.next() {
+                if arg == "--tab" {
+                    tab = args.next().and_then(|n| n.parse().ok()).unwrap_or(tab);
+                }
+            }
+            log::info!("surface: opening on tab {tab}");
             Self {
-                tab: 0,
+                tab,
                 producer: None,
             }
         }
@@ -248,6 +305,17 @@ mod demo {
 
     impl Render for Showcase {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            // A producer's dma-buf is importable only on the GPU the window draws through, and that
+            // GPU is reachable only from a `gpu_canvas`. So paint one reporting canvas first and
+            // build no producer until it has: a producer that picked its own device would export on
+            // a different GPU and every tile would be dropped at import. One frame of empty tiles.
+            #[cfg(target_os = "linux")]
+            if !renderer_gpu_reported() {
+                cx.notify();
+                window.request_animation_frame();
+                return gpui::gpu_canvas(report_renderer_gpu).size_full().into_any_element();
+            }
+
             #[cfg(target_os = "linux")]
             let (formats, tiles) = (
                 wgpu_backend::FORMATS,
@@ -316,6 +384,40 @@ mod demo {
                         .gap_6()
                         .children(tiles),
                 )
+                .into_any_element()
+        }
+    }
+
+    /// Whether the window's renderer has reported the GPU a producer must export on. `None` until a
+    /// `gpu_canvas` has painted, which is why the window paints one before it builds any producer.
+    #[cfg(target_os = "linux")]
+    fn renderer_gpu_reported() -> bool {
+        gpui_interop::gpu_id().is_some()
+    }
+
+    std::thread_local! {
+        /// The Vulkan device borrowed from the window's renderer, stashed by the first reporting
+        /// canvas so a producer built off the paint exports its dma-bufs on the GPU the window draws
+        /// through. A dma-buf is importable only on the GPU it was exported from, and the renderer's
+        /// device is reachable only from a canvas, so this is where the two frames meet.
+        static RENDERER_DEVICE: std::cell::RefCell<Option<gpui_interop::GpuDevice>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Report the renderer's GPU and stash its device, so the producer exports on the GPU the window
+    /// draws through. A dma-buf is importable only on the GPU it was exported from, and that device is
+    /// reachable only from the canvas, so this is the one place it can be learned.
+    #[cfg(target_os = "linux")]
+    fn report_renderer_gpu(gpu: &mut gpui::GpuCanvasContext) {
+        let Some(interop) = gpui_interop::attach(gpu.try_device::<gpui_wgpu::WgpuRenderer>()).ok()
+        else {
+            return;
+        };
+        if let Some(id) = interop.adapter().gpu_id() {
+            gpui_interop::remember(id);
+        }
+        if let Some(device) = interop.adapter().gpu_device() {
+            RENDERER_DEVICE.with(|slot| *slot.borrow_mut() = Some(device));
         }
     }
 
@@ -381,18 +483,16 @@ mod demo {
     #[cfg(target_os = "linux")]
     mod wgpu_backend {
         use std::cell::RefCell;
-        use std::os::fd::{FromRawFd, OwnedFd};
         use std::rc::Rc;
         use std::sync::Arc;
 
         use super::{DECODED_COLOUR, TILE, error_panel, panel, test_card};
         use anyhow::{Context as _, Result};
-        use ash::vk;
         use gpui::{
-            AnyElement, ChromaReconstruction, Corners, DmaBufHandle, DmaBufPlane,
-            ImportedTextureExt as _, ImportedTextureHandle, SurfaceFormatKind, Window, gpu_canvas,
-            prelude::*, surface,
+            AnyElement, ChromaReconstruction, Corners, DmaBufHandle, ImportedTextureExt as _,
+            ImportedTextureHandle, SurfaceFormatKind, Window, gpu_canvas, prelude::*, surface,
         };
+        use gpui_interop::{GpuDevice, PlaneLayout, SharedBuffer};
 
         /// The format dimension: one tab per payload the platform can carry, plus the same NV12
         /// buffer sampled both ways so the chroma reconstruction can be compared, and the one a
@@ -407,8 +507,8 @@ mod demo {
         ];
 
         pub struct Producer {
-            /// The device the dma-bufs are exported from. It must outlive every handle made from it.
-            _vulkan: Vulkan,
+            /// The shareable buffers, held so their memory outlives the handles made from them.
+            _buffers: Vec<SharedBuffer>,
             /// `surface()` with a dma-buf in each of the three formats.
             bgra: DmaBufHandle,
             rgba: DmaBufHandle,
@@ -440,68 +540,100 @@ mod demo {
 
         impl Producer {
             fn new() -> Result<Self> {
-                let mut vulkan = Vulkan::new()?;
+                super::RENDERER_DEVICE.with(|slot| {
+                    let device = slot.borrow();
+                    let device = device
+                        .as_ref()
+                        .context("the window's renderer has not reported its GPU yet")?;
+                    Self::on(device)
+                })
+            }
+
+            /// Build every payload on `device`, the renderer's own device.
+            fn on(device: &GpuDevice) -> Result<Self> {
+                let mut buffers = Vec::new();
 
                 // A single plane per format, each holding the test card in its own byte order.
-                let bgra_fd = vulkan.allocate(&test_card::bgra8(TILE))?;
-                let bgra = DmaBufHandle::new(
+                let bgra_buffer = SharedBuffer::export_at(
+                    device,
                     TILE,
                     TILE,
                     SurfaceFormatKind::bgra8(),
-                    DmaBufHandle::LINEAR,
-                    [DmaBufPlane::new(bgra_fd, 0, TILE * 4)],
-                    None,
-                );
+                    &[PlaneLayout {
+                        offset: 0,
+                        stride: TILE * 4,
+                    }],
+                    &test_card::bgra8(TILE),
+                )
+                .context("export the bgra8 card")?;
+                let bgra = bgra_buffer.handle();
+                buffers.push(bgra_buffer);
 
-                let rgba_fd = vulkan.allocate(&test_card::rgba8(TILE))?;
-                let rgba = DmaBufHandle::new(
+                let rgba_buffer = SharedBuffer::export_at(
+                    device,
                     TILE,
                     TILE,
                     SurfaceFormatKind::rgba8(),
-                    DmaBufHandle::LINEAR,
-                    [DmaBufPlane::new(rgba_fd, 0, TILE * 4)],
-                    None,
-                );
+                    &[PlaneLayout {
+                        offset: 0,
+                        stride: TILE * 4,
+                    }],
+                    &test_card::rgba8(TILE),
+                )
+                .context("export the rgba8 card")?;
+                let rgba = rgba_buffer.handle();
+                buffers.push(rgba_buffer);
 
                 // Two planes in one allocation: full-resolution luma, then half-resolution interleaved
-                // chroma. Both planes are written whole, padding included.
-                let luma_size = TILE * TILE;
-                let content = test_card::nv12(TILE);
-                let fd = vulkan.allocate(&content)?;
-                let chroma_fd = fd
-                    .try_clone()
-                    .context("duplicate the dma-buf for the chroma plane")?;
-                let nv12 = DmaBufHandle::new(
+                // chroma — at the offset **the producer declares**, the canonical DRM `NV12` layout
+                // with chroma directly after the luma. The renderer honours the handle's layout rather
+                // than its own, so this renders where a driver whose linear layout pads luma to 64 KiB
+                // (NVIDIA) would otherwise read the padding as chroma — zero chroma, which converts to
+                // green.
+                let luma = (TILE * TILE) as usize;
+                let chroma = (TILE / 2) as usize * (TILE / 2) as usize * 2;
+                let mut content = vec![0u8; luma + chroma];
+                test_card::write_luma(&mut content, TILE, 0, TILE as usize);
+                test_card::write_chroma(&mut content, TILE, luma, TILE as usize);
+                let planes = [
+                    PlaneLayout {
+                        offset: 0,
+                        stride: TILE,
+                    },
+                    PlaneLayout {
+                        offset: luma as u64,
+                        stride: TILE,
+                    },
+                ];
+
+                let nv12_buffer = SharedBuffer::export_at(
+                    device,
                     TILE,
                     TILE,
                     SurfaceFormatKind::nv12(),
-                    DmaBufHandle::LINEAR,
-                    [
-                        DmaBufPlane::new(fd, 0, TILE),
-                        DmaBufPlane::new(chroma_fd, luma_size as u64, TILE),
-                    ],
-                    None,
-                );
+                    &planes,
+                    &content,
+                )
+                .context("export the nv12 card")?;
+                let nv12 = nv12_buffer.handle();
+                buffers.push(nv12_buffer);
 
                 // A second NV12 buffer over the same card, asking for luma-guided chroma: the same
                 // bytes the renderer would otherwise sample bilinearly, reconstructed against the
                 // sharp luma plane instead.
-                let sharp_fd = vulkan.allocate(&content)?;
-                let sharp_chroma_fd = sharp_fd
-                    .try_clone()
-                    .context("duplicate the dma-buf for the guided chroma plane")?;
-                let nv12_sharp = DmaBufHandle::new(
+                let sharp_buffer = SharedBuffer::export_at(
+                    device,
                     TILE,
                     TILE,
                     SurfaceFormatKind::nv12(),
-                    DmaBufHandle::LINEAR,
-                    [
-                        DmaBufPlane::new(sharp_fd, 0, TILE),
-                        DmaBufPlane::new(sharp_chroma_fd, luma_size as u64, TILE),
-                    ],
-                    None,
+                    &planes,
+                    &content,
                 )
-                .with_chroma(ChromaReconstruction::LumaGuided);
+                .context("export the luma-guided nv12 card")?;
+                let nv12_sharp = sharp_buffer
+                    .handle()
+                    .with_chroma(ChromaReconstruction::LumaGuided);
+                buffers.push(sharp_buffer);
 
                 // The decoded tab: `gpui_va` decodes the fixture's H.264 keyframe on the GPU with
                 // libavcodec, into the same `Y_TILED` surface a video player would, and exports it.
@@ -520,7 +652,7 @@ mod demo {
                 };
 
                 Ok(Self {
-                    _vulkan: vulkan,
+                    _buffers: buffers,
                     bgra,
                     rgba,
                     nv12,
@@ -703,138 +835,6 @@ mod demo {
             }
         }
 
-        /// A minimal Vulkan "producer": the loader, instance and device that keep the exported
-        /// dma-bufs alive for as long as the renderer samples them.
-        ///
-        /// The `Entry` must outlive the device it made — dropping it unloads the loader the device's
-        /// calls go through — so it is a field and the device is destroyed explicitly first.
-        struct Vulkan {
-            _entry: ash::Entry,
-            instance: ash::Instance,
-            device: ash::Device,
-            external_memory_fd: ash::khr::external_memory_fd::Device,
-            /// Every allocation ever exported; kept alive, not read.
-            memories: Vec<vk::DeviceMemory>,
-            /// A host-visible, host-coherent memory type the allocations are made in.
-            memory_type_index: u32,
-        }
-
-        impl Vulkan {
-            fn new() -> Result<Self> {
-                let entry = unsafe { ash::Entry::load() }
-                    .map_err(|error| anyhow::anyhow!("load vulkan: {error}"))?;
-                let app_info =
-                    vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
-                let instance = unsafe {
-                    entry.create_instance(
-                        &vk::InstanceCreateInfo::default().application_info(&app_info),
-                        None,
-                    )
-                }
-                .context("create the producer instance")?;
-
-                let devices = unsafe { instance.enumerate_physical_devices() }
-                    .context("enumerate physical devices")?;
-                // Prefer the integrated GPU, the one a renderer is usually steered to; fall back to
-                // whatever the driver lists first.
-                let physical = devices
-                    .iter()
-                    .copied()
-                    .find(|device| {
-                        let properties =
-                            unsafe { instance.get_physical_device_properties(*device) };
-                        properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
-                    })
-                    .or_else(|| devices.first().copied())
-                    .context("no Vulkan device for the producer")?;
-
-                let properties =
-                    unsafe { instance.get_physical_device_memory_properties(physical) };
-                let memory_type_index = properties
-                    .memory_types
-                    .iter()
-                    .enumerate()
-                    .find(|(_, memory_type)| {
-                        memory_type.property_flags.contains(
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )
-                    })
-                    .map(|(index, _)| index as u32)
-                    .context("no host-visible memory for the producer")?;
-
-                let extensions = [
-                    vk::KHR_EXTERNAL_MEMORY_FD_NAME.as_ptr(),
-                    vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME.as_ptr(),
-                ];
-                let device = unsafe {
-                    instance.create_device(
-                        physical,
-                        &vk::DeviceCreateInfo::default().enabled_extension_names(&extensions),
-                        None,
-                    )
-                }
-                .context("create the producer device")?;
-                let external_memory_fd =
-                    ash::khr::external_memory_fd::Device::new(&instance, &device);
-
-                Ok(Self {
-                    _entry: entry,
-                    instance,
-                    device,
-                    external_memory_fd,
-                    memories: Vec::new(),
-                    memory_type_index,
-                })
-            }
-
-            /// Allocate `content` in a host-visible buffer and export it as a linear dma-buf.
-            fn allocate(&mut self, content: &[u8]) -> Result<OwnedFd> {
-                let size = content.len() as u64;
-                let mut export_info = vk::ExportMemoryAllocateInfo::default()
-                    .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-                let memory = unsafe {
-                    self.device.allocate_memory(
-                        &vk::MemoryAllocateInfo::default()
-                            .allocation_size(size)
-                            .memory_type_index(self.memory_type_index)
-                            .push_next(&mut export_info),
-                        None,
-                    )
-                }
-                .context("allocate the producer buffer")?;
-
-                unsafe {
-                    let mapped =
-                        self.device
-                            .map_memory(memory, 0, size, vk::MemoryMapFlags::empty())
-                            .context("map the producer buffer")? as *mut u8;
-                    std::ptr::copy_nonoverlapping(content.as_ptr(), mapped, content.len());
-                    self.device.unmap_memory(memory);
-                }
-
-                let fd = unsafe {
-                    self.external_memory_fd.get_memory_fd(
-                        &vk::MemoryGetFdInfoKHR::default()
-                            .memory(memory)
-                            .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
-                    )
-                }
-                .context("export the producer's dma-buf")?;
-                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-                self.memories.push(memory);
-                Ok(owned)
-            }
-        }
-
-        impl Drop for Vulkan {
-            fn drop(&mut self) {
-                unsafe {
-                    self.device.destroy_device(None);
-                    self.instance.destroy_instance(None);
-                }
-            }
-        }
     }
 
     /// Windows' producer: Direct3D 11 on the device the window's renderer lends — the route a

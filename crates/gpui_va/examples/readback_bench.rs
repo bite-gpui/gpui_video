@@ -31,7 +31,49 @@ enum Mode {
     Staged,
 }
 
+/// Print the `log` records the libraries emit, which are otherwise dropped: without a logger,
+/// `gpui_va`'s reason for refusing a file never reaches the terminal. Off unless `RUST_LOG` is set.
+fn install_logger_if_requested() {
+    struct Stderr;
+
+    impl log::Log for Stderr {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::max_level()
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if self.enabled(record.metadata()) {
+                eprintln!("[{}] {}", record.level(), record.args());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    let level = match std::env::var("RUST_LOG").ok().as_deref() {
+        None => return,
+        Some(value) if value.contains("trace") => log::LevelFilter::Trace,
+        Some(value) if value.contains("debug") => log::LevelFilter::Debug,
+        Some(value) if value.contains("info") => log::LevelFilter::Info,
+        Some(value) if value.contains("error") => log::LevelFilter::Error,
+        Some(_) => log::LevelFilter::Warn,
+    };
+    let _ = log::set_boxed_logger(Box::new(Stderr));
+    log::set_max_level(level);
+}
+
 fn main() {
+    install_logger_if_requested();
+
+    // A benchmark has no window to report the renderer's GPU, and `gpui_va` exports a dma-buf only on
+    // the device the window draws through — with none reported it refuses to open a decoder at all.
+    // So name the first device that can export one, the same stand-in the tests use.
+    if gpui_interop::gpu_id().is_none()
+        && let Ok(device) = gpui_interop::GpuDevice::open()
+    {
+        gpui_interop::remember(device.gpu_id());
+    }
+
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
         eprintln!("usage: readback_bench <file> [frames]");
@@ -41,7 +83,10 @@ fn main() {
     let path = Path::new(&path);
 
     let Some((plain, size)) = decode(path, frames) else {
-        eprintln!("could not open: libavformat/libavcodec/libva of the declared ABI, or no video");
+        eprintln!(
+            "could not open: libavformat/libavcodec of the declared ABI, no VA-API device that \
+             exports a dma-buf, or no video — set RUST_LOG=warn for the reason"
+        );
         return;
     };
     let Some(allocating) = readback(path, frames, Mode::Allocating) else {

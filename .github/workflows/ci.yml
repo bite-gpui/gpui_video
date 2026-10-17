@@ -6,8 +6,9 @@
 # hosted runner has no GPU, and the surface test is written to skip rather than fail for exactly that
 # reason, so running it would assert nothing.
 #
-# The core comes in as a git dependency, so this builds it from source; the `check` is where a change
-# to the core that breaks the producer side is caught.
+# The core comes in as the published `bite-gpui` 1.23.301 release, so this builds the producer side
+# against exactly what a consumer resolves (not a branch); the `check` is where a change to the
+# workspace that breaks a target is caught.
 name: CI
 
 on:

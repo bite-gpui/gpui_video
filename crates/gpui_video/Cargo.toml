@@ -12,6 +12,12 @@ workspace = true
 path = "src/gpui_video.rs"
 doctest = false
 
+[features]
+# The `grid` example's morphorm layout-engine arm. The published `bite-gp-morphorm` is built against
+# the *published* core, whose `bite-gp-engine` cannot be patched to a working-tree checkout (the
+# package names differ), so the two cannot share a graph: the arm is opt-in and off by default.
+morphorm = ["dep:gpui_morphorm"]
+
 [dependencies]
 # The authoring half of the element API — `gpu_canvas`, `Render`, `Context` — and, re-exported through
 # it, `gpui_engine`'s `SurfaceSource`. Not the facade: an element depends on the authoring crate, the
@@ -22,6 +28,13 @@ gpui_video_platform.workspace = true
 # The bus between the UI thread and the service thread that owns the pipeline: commands out, decoded
 # frames back. Only `Send` values cross, so the pipeline itself never has to be `Send`.
 flume.workspace = true
+
+# The `grid` example installs a different layout engine, to weigh the layout pass against the rest of
+# the frame. A *published* swap, built against the *published* core, so it cannot be unified with a
+# working-tree checkout of that core (its `bite-gp-engine` and a path `gpui_engine` are different
+# packages). Hence optional and behind `morphorm`, off by default: the library never names it, and a
+# working-tree build turns the feature off rather than holding two `gpui_engine`s.
+gpui_morphorm = { workspace = true, optional = true }
 
 # `gpui_video` is the facade over the platform producers, so it may name them: the source shape opens
 # a file itself and needs the platform's decoder to do it. Each backend is Linux/macOS/Windows-scoped,
@@ -42,3 +55,6 @@ image.workspace = true
 smallvec.workspace = true
 # The grid example measures its workers' CPU time, which the standard library does not expose.
 libc.workspace = true
+# The grid example installs a logger, so the libraries' `log::warn!` diagnostics (why a source would
+# not open) are visible under `RUST_LOG`.
+log.workspace = true

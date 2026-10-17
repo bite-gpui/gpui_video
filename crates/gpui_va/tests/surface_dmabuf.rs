@@ -2,8 +2,10 @@
 //!
 //! Two authoring layers reach one: the `surface()` element (single-plane `Bgra8`/`Rgba8`, two-plane
 //! `Nv12`) and `gpu_canvas(..)`'s paint callback (a same-device `wgpu::TextureView`). The producer
-//! is a bare Vulkan device (not wgpu), the consumer is the platform's headless renderer — the same
-//! one a window drives — and the pixels are read back with `capture_screenshot`.
+//! exports through `gpui_interop::SharedBuffer::export_at` on the renderer's **own** device — a
+//! dma-buf is importable only on the GPU it was exported from — the consumer is the platform's
+//! headless renderer, the same one a window drives, and the pixels are read back with
+//! `capture_screenshot`.
 //!
 //! Opt in, because it needs a GPU and the crate's own unit-test target does not build:
 //!
@@ -20,8 +22,8 @@
 //! A userspace fault *while GPU work is in flight* can wedge that GPU: an earlier revision dropped
 //! the Vulkan loader before the device it had made, and its crash produced `NVRM: Xid 13` followed by
 //! repeated `Xid 158` (`NV_UFLUSH_FB_FLUSH` timeout) on an NVIDIA 930M, hanging the machine until
-//! reboot. This test keeps the loader alive and both the renderer and the producer on the integrated
-//! GPU, but you can pin the adapter explicitly too:
+//! reboot. This test keeps the loader alive, and the producer exports on the renderer's own device —
+//! whichever GPU the renderer chose — but you can pin the adapter explicitly too:
 //!
 //! ```text
 //! ZED_DEVICE_ID=1916 cargo test -p gpui_va --features test-support --test surface_dmabuf
@@ -33,19 +35,19 @@
 
 #![cfg(all(target_os = "linux", feature = "test-support"))]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::Write as _;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
 
-use ash::vk;
 use gpui::{
     AnyWindowHandle, AppContext as _, Context, Corners, DmaBufHandle, DmaBufPlane,
     HeadlessAppContext, ImportedTextureHandle, IntoElement, Render, SurfaceFormatKind, Window, div,
     gpu_canvas, prelude::*, px, size, surface,
 };
-use gpui_wgpu::{CosmicTextSystem, ImportedTextureExt as _, WgpuRenderer};
+use gpui_interop::{GpuDevice, PlaneLayout, SharedBuffer, Tiling};
+use gpui_wgpu::{CosmicTextSystem, ImportedTextureExt as _, WgpuHeadlessRenderer, WgpuRenderer};
 
 const WIDTH: u32 = 64;
 const HEIGHT: u32 = 64;
@@ -55,109 +57,102 @@ const COLOUR: [u8; 4] = [128, 128, 0, 255];
 /// `COLOUR` in the byte order a `Bgra8` buffer stores: blue, green, red, alpha.
 const BGRA_COLOUR: [u8; 4] = [COLOUR[2], COLOUR[1], COLOUR[0], COLOUR[3]];
 
-/// Keeps the exported dma-buf alive: the loader must outlive the device it made, and the device the
-/// memory it exported.
-struct Producer {
-    _entry: ash::Entry,
-    instance: ash::Instance,
-    device: ash::Device,
-    _memory: vk::DeviceMemory,
+/// Borrow the renderer's own device, on the GPU this process draws its headless frames through.
+///
+/// A dma-buf is importable only on the GPU it was exported from, and the renderer's device is reachable
+/// only from a `gpu_canvas` callback, so this opens a throwaway headless window, paints one frame to
+/// run a canvas, and lifts the device back out. It stays valid after that context drops:
+/// `WgpuContext::new_headless` caches the context in a process-wide static, so the instance the device
+/// was made from is never torn down for the life of the process.
+fn renderer_device() -> Option<GpuDevice> {
+    let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
+    let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
+        gpui::current_headless_renderer()
+    });
+
+    let device: Rc<RefCell<Option<GpuDevice>>> = Rc::new(RefCell::new(None));
+    let slot = device.clone();
+    let window = cx
+        .open_window(size(px(WIDTH as f32), px(HEIGHT as f32)), move |_window, cx| {
+            cx.new(|_| DeviceProbeView { device: slot })
+        })
+        .ok()?;
+    let window: AnyWindowHandle = window.into();
+
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        let _ = window.draw(cx);
+    })
+    .ok()?;
+
+    device.borrow_mut().take()
 }
 
-impl Drop for Producer {
-    fn drop(&mut self) {
-        unsafe {
-            self.device.destroy_device(None);
-            self.instance.destroy_instance(None);
-        }
+/// A view whose only job is to run one `gpu_canvas` callback, where the renderer's device is reachable,
+/// and stash it for the caller of [`renderer_device`].
+struct DeviceProbeView {
+    device: Rc<RefCell<Option<GpuDevice>>>,
+}
+
+impl Render for DeviceProbeView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let slot = self.device.clone();
+        gpu_canvas(move |gpu| {
+            // `WgpuHeadlessRenderer`, not `WgpuRenderer`: a headless window draws through the headless
+            // renderer, and only the renderer the window actually holds lends a device.
+            let Ok(interop) = gpui_interop::attach(gpu.try_device::<WgpuHeadlessRenderer>()) else {
+                return;
+            };
+            if let Some(device) = interop.adapter().gpu_device() {
+                *slot.borrow_mut() = Some(device);
+            }
+        })
+        .size_full()
     }
 }
 
-/// Allocate a linear dma-buf holding `content`, preferring the integrated GPU, and export its fd.
-/// `None` when there is no Vulkan device to allocate on.
-fn produce_dmabuf(content: &[u8]) -> Option<(Producer, OwnedFd)> {
-    fn inner(content: &[u8]) -> anyhow::Result<(Producer, OwnedFd)> {
-        let entry = unsafe { ash::Entry::load() }
-            .map_err(|error| anyhow::anyhow!("load vulkan: {error}"))?;
-        let app_info = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 1, 0));
-        let instance = unsafe {
-            entry.create_instance(
-                &vk::InstanceCreateInfo::default().application_info(&app_info),
-                None,
-            )
-        }?;
-        let devices = unsafe { instance.enumerate_physical_devices() }?;
-        let physical = devices
-            .iter()
-            .copied()
-            .find(|device| {
-                let properties = unsafe { instance.get_physical_device_properties(*device) };
-                properties.device_type == vk::PhysicalDeviceType::INTEGRATED_GPU
-            })
-            .or_else(|| devices.first().copied())
-            .ok_or_else(|| anyhow::anyhow!("no Vulkan device for the producer"))?;
-        let properties = unsafe { instance.get_physical_device_memory_properties(physical) };
-        let memory_type_index = properties
-            .memory_types
-            .iter()
-            .enumerate()
-            .find(|(_, memory_type)| {
-                memory_type.property_flags.contains(
-                    vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                )
-            })
-            .map(|(index, _)| index as u32)
-            .ok_or_else(|| anyhow::anyhow!("no host-visible memory for the producer"))?;
-        let extensions = [
-            vk::KHR_EXTERNAL_MEMORY_FD_NAME.as_ptr(),
-            vk::EXT_EXTERNAL_MEMORY_DMA_BUF_NAME.as_ptr(),
-        ];
-        let device = unsafe {
-            instance.create_device(
-                physical,
-                &vk::DeviceCreateInfo::default().enabled_extension_names(&extensions),
-                None,
-            )
-        }?;
-        let external_memory_fd = ash::khr::external_memory_fd::Device::new(&instance, &device);
+/// A buffer exported on the renderer's GPU, kept with the device it came from so the device outlives
+/// the memory and the memory outlives the handle's fds.
+///
+/// Declaration order is load-bearing: `SharedBuffer` frees its memory through a clone of the device's
+/// `ash::Device`, and the `GpuDevice` destroys that device when it drops, so the buffer is declared
+/// first and Rust drops it before the device.
+struct Exported {
+    buffer: SharedBuffer,
+    _device: GpuDevice,
+}
 
-        let size = content.len() as u64;
-        let mut export_info = vk::ExportMemoryAllocateInfo::default()
-            .handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-        let memory = unsafe {
-            device.allocate_memory(
-                &vk::MemoryAllocateInfo::default()
-                    .allocation_size(size)
-                    .memory_type_index(memory_type_index)
-                    .push_next(&mut export_info),
-                None,
-            )
-        }?;
-        unsafe {
-            let mapped =
-                device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty())? as *mut u8;
-            std::ptr::copy_nonoverlapping(content.as_ptr(), mapped, content.len());
-            device.unmap_memory(memory);
-        }
-        let fd = unsafe {
-            external_memory_fd.get_memory_fd(
-                &vk::MemoryGetFdInfoKHR::default()
-                    .memory(memory)
-                    .handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT),
-            )
-        }?;
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok((
-            Producer {
-                _entry: entry,
-                instance,
-                device,
-                _memory: memory,
-            },
-            owned,
-        ))
+impl Exported {
+    /// The description the `surface()` element takes.
+    fn handle(&self) -> DmaBufHandle {
+        self.buffer.handle()
     }
-    inner(content).ok()
+}
+
+/// Export `content` as a linear dma-buf with the plane layout `planes` declares, on the renderer's own
+/// device — the only one that can import the result. `None`, with a line to `stderr`, when there is no
+/// such device or the export fails: a skip rather than a failure.
+fn export(
+    width: u32,
+    height: u32,
+    format: SurfaceFormatKind,
+    planes: &[PlaneLayout],
+    content: &[u8],
+) -> Option<Exported> {
+    let Some(device) = renderer_device() else {
+        eprintln!("skipping: the renderer lends no device to export on");
+        return None;
+    };
+    match SharedBuffer::export_at(&device, width, height, format, planes, content) {
+        Ok(buffer) => Some(Exported {
+            buffer,
+            _device: device,
+        }),
+        Err(error) => {
+            eprintln!("skipping: could not export a dma-buf: {error:#}");
+            None
+        }
+    }
 }
 
 struct SurfaceView {
@@ -176,11 +171,56 @@ impl Render for SurfaceView {
 fn composite(handle: DmaBufHandle) -> anyhow::Result<[u8; 4]> {
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        Ok(gpui::current_headless_renderer())
+        gpui::current_headless_renderer()
     });
 
     let window = cx.open_window(size(px(WIDTH as f32), px(HEIGHT as f32)), |_window, cx| {
         cx.new(|_| SurfaceView { handle })
+    })?;
+    let window: AnyWindowHandle = window.into();
+
+    cx.run_until_parked();
+    cx.update_window(window, |_, window, cx| {
+        let _ = window.draw(cx);
+    })?;
+
+    let image = cx.capture_screenshot(window)?;
+    Ok(image.get_pixel(WIDTH / 2, HEIGHT / 2).0)
+}
+
+/// Lay a row pattern into `content` at `plane`, honouring the plane's own stride — the whole-object
+/// layout [`export_at`](gpui_interop::SharedBuffer::export_at) demands, where a row may be padded
+/// past the pixels in it.
+fn fill_plane(content: &mut [u8], plane: &PlaneLayout, width: usize, rows: usize, pattern: &[u8]) {
+    let base = plane.offset as usize;
+    let stride = plane.stride as usize;
+    for row in 0..rows {
+        let start = base + row * stride;
+        for (column, byte) in content[start..start + width].iter_mut().enumerate() {
+            *byte = pattern[column % pattern.len()];
+        }
+    }
+}
+
+/// A view that paints nothing — the window a dropped surface leaves behind.
+struct EmptyView;
+
+impl Render for EmptyView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div().size_full()
+    }
+}
+
+/// The centre pixel of a window with nothing painted in it — what a *dropped* surface leaves behind,
+/// and the reference a refusal is checked against: a composited tile would never match it.
+fn empty_window_pixel() -> anyhow::Result<[u8; 4]> {
+    let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
+    let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
+        gpui::current_headless_renderer()
+    });
+
+    let window = cx.open_window(size(px(WIDTH as f32), px(HEIGHT as f32)), |_window, cx| {
+        cx.new(|_| EmptyView)
     })?;
     let window: AnyWindowHandle = window.into();
 
@@ -277,7 +317,7 @@ fn imported_texture(
 fn composite_canvas(colour: [u8; 4]) -> anyhow::Result<Option<[u8; 4]>> {
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        Ok(gpui::current_headless_renderer())
+        gpui::current_headless_renderer()
     });
 
     let painted = Rc::new(Cell::new(false));
@@ -301,20 +341,11 @@ fn composite_canvas(colour: [u8; 4]) -> anyhow::Result<Option<[u8; 4]>> {
     Ok(Some(image.get_pixel(WIDTH / 2, HEIGHT / 2).0))
 }
 
-/// The renderer the platform builds for a headless context; `None` where there is no adapter, which
-/// is a skip rather than a failure.
+/// Whether a headless renderer exists at all — an error or `None` where there is no adapter, which is
+/// a skip rather than a failure. The device a producer exports on is reached later, from a canvas, by
+/// [`renderer_device`]; this only gates whether it is worth painting one.
 fn gpu_available() -> bool {
-    if gpui::current_headless_renderer().is_none() {
-        return false;
-    }
-    // A test has no window to report the renderer's GPU, so name the first device that exports a
-    // dma-buf; the module docs' `ZED_DEVICE_ID` pin lands the renderer there too, so the two agree.
-    if gpui_interop::gpu_id().is_none()
-        && let Ok(device) = gpui_interop::GpuDevice::open()
-    {
-        gpui_interop::remember(device.gpu_id());
-    }
-    true
+    gpui::current_headless_renderer().is_ok_and(|renderer| renderer.is_some())
 }
 
 #[test]
@@ -327,20 +358,20 @@ fn a_single_plane_surface_reads_back_byte_for_byte() {
     for _ in 0..(WIDTH * HEIGHT) {
         content.extend_from_slice(&COLOUR);
     }
-    let Some((_producer, fd)) = produce_dmabuf(&content) else {
-        eprintln!("skipping: could not allocate a dma-buf");
-        return;
-    };
-    let handle = DmaBufHandle::new(
+    let Some(exported) = export(
         WIDTH,
         HEIGHT,
         SurfaceFormatKind::rgba8(),
-        DmaBufHandle::LINEAR,
-        [DmaBufPlane::new(fd, 0, WIDTH * 4)],
-        None,
-    );
+        &[PlaneLayout {
+            offset: 0,
+            stride: WIDTH * 4,
+        }],
+        &content,
+    ) else {
+        return;
+    };
 
-    let pixel = composite(handle).expect("composite the surface");
+    let pixel = composite(exported.handle()).expect("composite the surface");
     assert_eq!(pixel, COLOUR);
 }
 
@@ -356,8 +387,16 @@ fn the_renderer_signals_a_surfaces_release_descriptor() {
     for _ in 0..(WIDTH * HEIGHT) {
         content.extend_from_slice(&COLOUR);
     }
-    let Some((_producer, fd)) = produce_dmabuf(&content) else {
-        eprintln!("skipping: could not allocate a dma-buf");
+    let Some(exported) = export(
+        WIDTH,
+        HEIGHT,
+        SurfaceFormatKind::rgba8(),
+        &[PlaneLayout {
+            offset: 0,
+            stride: WIDTH * 4,
+        }],
+        &content,
+    ) else {
         return;
     };
 
@@ -367,17 +406,9 @@ fn the_renderer_signals_a_surfaces_release_descriptor() {
     // SAFETY: `eventfd` returned a fresh descriptor this process owns.
     let release = unsafe { OwnedFd::from_raw_fd(release) };
 
-    let handle = DmaBufHandle::new(
-        WIDTH,
-        HEIGHT,
-        SurfaceFormatKind::rgba8(),
-        DmaBufHandle::LINEAR,
-        [DmaBufPlane::new(fd, 0, WIDTH * 4)],
-        None,
-    )
     // The handle takes ownership of the descriptor, so hand it a duplicate and keep the original to
     // wait on.
-    .with_release(
+    let handle = exported.handle().with_release(
         release
             .try_clone()
             .expect("duplicate the release descriptor"),
@@ -411,20 +442,20 @@ fn a_single_bgra_plane_reads_back_as_the_source_colour() {
     for _ in 0..(WIDTH * HEIGHT) {
         content.extend_from_slice(&BGRA_COLOUR);
     }
-    let Some((_producer, fd)) = produce_dmabuf(&content) else {
-        eprintln!("skipping: could not allocate a dma-buf");
-        return;
-    };
-    let handle = DmaBufHandle::new(
+    let Some(exported) = export(
         WIDTH,
         HEIGHT,
         SurfaceFormatKind::bgra8(),
-        DmaBufHandle::LINEAR,
-        [DmaBufPlane::new(fd, 0, WIDTH * 4)],
-        None,
-    );
+        &[PlaneLayout {
+            offset: 0,
+            stride: WIDTH * 4,
+        }],
+        &content,
+    ) else {
+        return;
+    };
 
-    let pixel = composite(handle).expect("composite the surface");
+    let pixel = composite(exported.handle()).expect("composite the surface");
     assert_eq!(pixel, COLOUR);
 }
 
@@ -438,20 +469,37 @@ fn a_surface_with_a_signalled_acquire_fence_is_waited_on() {
     for _ in 0..(WIDTH * HEIGHT) {
         content.extend_from_slice(&COLOUR);
     }
-    let Some((_producer, fd)) = produce_dmabuf(&content) else {
-        eprintln!("skipping: could not allocate a dma-buf");
+    let Some(exported) = export(
+        WIDTH,
+        HEIGHT,
+        SurfaceFormatKind::rgba8(),
+        &[PlaneLayout {
+            offset: 0,
+            stride: WIDTH * 4,
+        }],
+        &content,
+    ) else {
         return;
     };
     // A `sync_file` is readable once its fence signals; a pipe holding a byte has that same shape,
     // so the renderer's wait returns at once and the surface still composites.
     let (read_end, mut write_end) = std::io::pipe().expect("a pipe to stand in for a sync_file");
     write_end.write_all(&[1]).expect("signal the fence");
+    // `export_at` carries no acquire fence, so rebuild the handle from the exported plane's fd with the
+    // fence attached — the same declared layout, and a duplicate of the fd the export made.
     let handle = DmaBufHandle::new(
         WIDTH,
         HEIGHT,
         SurfaceFormatKind::rgba8(),
         DmaBufHandle::LINEAR,
-        [DmaBufPlane::new(fd, 0, WIDTH * 4)],
+        [DmaBufPlane::new(
+            exported.handle().planes[0]
+                .fd
+                .try_clone()
+                .expect("duplicate the dma-buf"),
+            0,
+            WIDTH * 4,
+        )],
         Some(OwnedFd::from(read_end)),
     );
 
@@ -459,40 +507,51 @@ fn a_surface_with_a_signalled_acquire_fence_is_waited_on() {
     assert_eq!(pixel, COLOUR);
 }
 
+/// The consumer-guided contract: the driver picks the image's layout and the handle reports it, so
+/// the buffer is one this device samples by construction. That is what makes it the same fixture on
+/// a device whose linear `NV12` is the canonical DRM layout and on one that pads it, and it keeps
+/// the BT.601 path exercised on both.
 #[test]
 fn an_nv12_surface_converts_through_the_shader() {
     if !gpu_available() {
         eprintln!("skipping: no Vulkan adapter for the headless renderer");
         return;
     }
+    let Some(device) = renderer_device() else {
+        eprintln!("skipping: the renderer lends no device to export on");
+        return;
+    };
     let luma_size = (WIDTH * HEIGHT) as usize;
     let chroma_size = (WIDTH / 2 * HEIGHT / 2 * 2) as usize;
     // The shared colour in the two-plane form: full-resolution luma, then half-resolution
-    // interleaved chroma, carrying the bytes the BT.601 conversion maps back to olive.
+    // interleaved chroma, carrying the bytes the BT.601 conversion maps back to olive. `fill` takes
+    // each plane tightly packed at its own resolution; the driver places it in the image.
     let (y, cb, cr) = nv12_from_rgb(COLOUR);
-    let mut content = vec![y; luma_size + chroma_size];
-    for pair in content[luma_size..].as_chunks_mut::<2>().0 {
+    let luma = vec![y; luma_size];
+    let mut chroma = vec![0u8; chroma_size];
+    for pair in chroma.as_chunks_mut::<2>().0 {
         pair[0] = cb;
         pair[1] = cr;
     }
-    let Some((_producer, fd)) = produce_dmabuf(&content) else {
-        eprintln!("skipping: could not allocate a dma-buf");
-        return;
-    };
-    let chroma_fd = fd.try_clone().expect("duplicate the dma-buf");
-    let handle = DmaBufHandle::new(
+    let buffer = match SharedBuffer::new(
+        &device,
         WIDTH,
         HEIGHT,
         SurfaceFormatKind::nv12(),
-        DmaBufHandle::LINEAR,
-        [
-            DmaBufPlane::new(fd, 0, WIDTH),
-            DmaBufPlane::new(chroma_fd, luma_size as u64, WIDTH),
-        ],
-        None,
-    );
+        Tiling::Linear,
+    ) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            eprintln!("skipping: could not allocate an NV12 buffer: {error:#}");
+            return;
+        }
+    };
+    if let Err(error) = buffer.fill(&device, &[&luma, &chroma]) {
+        eprintln!("skipping: could not fill the NV12 buffer: {error:#}");
+        return;
+    }
 
-    let pixel = composite(handle).expect("composite the surface");
+    let pixel = composite(buffer.handle()).expect("composite the surface");
     // The same BT.601 matrix the shader applies, on the CPU, to the bytes the planes carry.
     let expected = ycbcr_to_rgb(
         f32::from(y) / 255.0,
@@ -505,6 +564,149 @@ fn an_nv12_surface_converts_through_the_shader() {
         assert!(
             (got - want).abs() <= 2,
             "channel {channel} is {got}, but the shader's matrix predicts {want}",
+        );
+    }
+    assert_eq!(pixel[3], 255, "the surface should be opaque");
+}
+
+/// A handle that declares a layout the driver does not produce is refused, not sampled.
+///
+/// [`export_at`](gpui_interop::SharedBuffer::export_at) lets a producer push a plane layout rather
+/// than take the one the driver chose, and a layout the driver did not choose is one it cannot
+/// sample: measured on an NVIDIA 930M, sampling such an image never completes and hangs the command
+/// processor. This buffer pads its luma plane, so its chroma sits at 8192 where the device's own
+/// linear layout puts it at 4096, and the importer drops the surface rather than bind it. The window
+/// stays empty, and the fixture colour would never match it.
+#[test]
+fn a_linear_nv12_surface_declaring_a_layout_the_driver_does_not_produce_is_refused() {
+    if !gpu_available() {
+        eprintln!("skipping: no Vulkan adapter for the headless renderer");
+        return;
+    }
+    let luma_size = (WIDTH * HEIGHT) as usize;
+    let chroma_size = (WIDTH / 2 * HEIGHT / 2 * 2) as usize;
+    // A whole page past the luma's end, which no driver's own linear layout would choose.
+    let chroma_offset = luma_size + 4096;
+    let (y, cb, cr) = nv12_from_rgb(COLOUR);
+
+    let mut content = vec![0u8; chroma_offset + chroma_size];
+    content[..luma_size].fill(y);
+    for pair in content[chroma_offset..].as_chunks_mut::<2>().0 {
+        pair[0] = cb;
+        pair[1] = cr;
+    }
+
+    let Some(exported) = export(
+        WIDTH,
+        HEIGHT,
+        SurfaceFormatKind::nv12(),
+        &[
+            PlaneLayout {
+                offset: 0,
+                stride: WIDTH,
+            },
+            PlaneLayout {
+                offset: chroma_offset as u64,
+                stride: WIDTH,
+            },
+        ],
+        &content,
+    ) else {
+        return;
+    };
+
+    let background = empty_window_pixel().expect("capture an empty window");
+    let pixel = composite(exported.handle()).expect("composite the refused surface");
+    assert_eq!(
+        pixel, background,
+        "the surface was not refused: the handle declares chroma at {chroma_offset}, where this \
+         device does not lay its own linear NV12 out. Sampling a layout the driver did not produce \
+         reads the padding as chroma (which composites green), and on some devices never completes",
+    );
+}
+
+/// The client's happy path, negotiated up front: ask the renderer's device which plane layout it
+/// gives a plain `LINEAR` image and how big the buffer must be, then export exactly that and
+/// composite it.
+///
+/// This is what [`GpuDevice::linear_layout`] exists for — a producer consults it *before* exporting,
+/// so the buffer it hands over is one the renderer takes. It is the portable half of the pair: a
+/// device whose linear `NV12` is the canonical DRM layout answers with it, and one that pads (an
+/// NVIDIA 930M puts chroma at 65536) answers with the padded layout, which the producer declares
+/// instead of its own idea. The colour assertion is the real test: it holds only if the renderer
+/// samples the planes where the handle declares them.
+#[test]
+fn a_buffer_sized_to_the_devices_report_composites() {
+    if !gpu_available() {
+        eprintln!("skipping: no Vulkan adapter for the headless renderer");
+        return;
+    }
+    let Some(device) = renderer_device() else {
+        eprintln!("skipping: the renderer lends no device to export on");
+        return;
+    };
+    let luma_size = (WIDTH * HEIGHT) as usize;
+    // What the producer *would* declare on its own — the DRM `NV12` convention, chroma directly
+    // after the luma. The report answers with the layout this device actually uses, which on a
+    // padding device is not this one; `declared` measures how far apart they are.
+    let proposed = [
+        PlaneLayout {
+            offset: 0,
+            stride: WIDTH,
+        },
+        PlaneLayout {
+            offset: luma_size as u64,
+            stride: WIDTH,
+        },
+    ];
+    let report = match device.linear_layout(SurfaceFormatKind::nv12(), WIDTH, HEIGHT, &proposed) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("skipping: the device will not make the declared layout: {error:#}");
+            return;
+        }
+    };
+    eprintln!(
+        "nv12 negotiation: native {:?}, required {}, proposed span {}",
+        report.native, report.required, report.declared,
+    );
+    let [luma, chroma] = <[PlaneLayout; 2]>::try_from(report.native.as_slice())
+        .expect("an NV12 layout has two planes");
+
+    // The producer's self-correction: declare the layout the device reported and size the buffer to
+    // what its image needs, placing the planes where that layout says.
+    let (y, cb, cr) = nv12_from_rgb(COLOUR);
+    let mut content = vec![0u8; report.required as usize];
+    fill_plane(&mut content, &luma, WIDTH as usize, HEIGHT as usize, &[y]);
+    fill_plane(&mut content, &chroma, WIDTH as usize, (HEIGHT / 2) as usize, &[cb, cr]);
+    let buffer = match SharedBuffer::export_at(
+        &device,
+        WIDTH,
+        HEIGHT,
+        SurfaceFormatKind::nv12(),
+        &report.native,
+        &content,
+    ) {
+        Ok(buffer) => buffer,
+        Err(error) => {
+            eprintln!("skipping: could not export a dma-buf: {error:#}");
+            return;
+        }
+    };
+
+    let pixel = composite(buffer.handle()).expect("composite the surface");
+    let expected = ycbcr_to_rgb(
+        f32::from(y) / 255.0,
+        f32::from(cb) / 255.0,
+        f32::from(cr) / 255.0,
+    );
+    for channel in 0..3 {
+        let want = (expected[channel] * 255.0).round() as i32;
+        let got = i32::from(pixel[channel]);
+        assert!(
+            (got - want).abs() <= 2,
+            "channel {channel} is {got}, but the declared layout predicts {want}; a device that \
+             samples its own padded layout instead reads the padding as chroma, which composites green",
         );
     }
     assert_eq!(pixel[3], 255, "the surface should be opaque");
@@ -553,7 +755,7 @@ fn a_tiled_nv12_surface_imports_under_its_modifier_and_converts() {
 fn composite_pixels(handle: DmaBufHandle) -> (u32, u32, Vec<[u8; 4]>) {
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        Ok(gpui::current_headless_renderer())
+        gpui::current_headless_renderer()
     });
     let window = cx
         .open_window(size(px(WIDTH as f32), px(HEIGHT as f32)), |_window, cx| {
@@ -804,7 +1006,7 @@ fn a_bounded_playback_plays_through_the_renderer() {
     let handle: Rc<RefCell<Option<DmaBufHandle>>> = Rc::new(RefCell::new(None));
     let text_system = std::sync::Arc::new(CosmicTextSystem::new("fallback"));
     let mut cx = HeadlessAppContext::with_platform(text_system, std::sync::Arc::new(()), || {
-        Ok(gpui::current_headless_renderer())
+        gpui::current_headless_renderer()
     });
     let view_handle = handle.clone();
     let window = cx

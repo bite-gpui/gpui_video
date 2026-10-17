@@ -41,10 +41,15 @@ libc.workspace = true
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 gpui = { workspace = true, features = ["platform", "test-support"] }
 gpui_wgpu = { workspace = true, features = ["test-support"] }
+# `Adapter::gpu_id` — and, with it, `gpui_interop::gpu_id` — is behind the `wgpu` feature. The
+# `surface` example reads it to export its dma-bufs on the GPU the window draws through; the library
+# itself never does, so the feature is a dev-dependency rather than a dependency.
+gpui_interop = { workspace = true, features = ["wgpu"] }
 wgpu.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 gpui = { workspace = true, features = ["platform"] }
+log.workspace = true
 core-foundation.workspace = true
 core-video.workspace = true
 foreign-types.workspace = true
@@ -54,5 +59,6 @@ wgpu.workspace = true
 
 [target.'cfg(target_os = "windows")'.dev-dependencies]
 gpui = { workspace = true, features = ["platform"] }
+log.workspace = true
 windows.workspace = true
 wgpu.workspace = true

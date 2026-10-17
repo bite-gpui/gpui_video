@@ -105,7 +105,7 @@ checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
 dependencies = [
  "cfg-if",
  "cipher",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "zeroize",
 ]
 
@@ -554,15 +554,6 @@ dependencies = [
 
 [[package]]
 name = "bit-set"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
-dependencies = [
- "bit-vec 0.8.0",
-]
-
-[[package]]
-name = "bit-set"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34ddef2995421ab6a5c779542c81ee77c115206f4ad9d5a8e05f4ff49716a3dd"
@@ -571,10 +562,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "bit-vec"
-version = "0.8.0"
+name = "bit-set"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+checksum = "56d87354e4229f54a44f7bf2435906a4656dba36026ab6eaca629a2c436a691c"
+dependencies = [
+ "bit-vec 0.10.1",
+]
 
 [[package]]
 name = "bit-vec"
@@ -583,10 +577,122 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71798fca2c1fe1086445a7258a4bc81e6e49dcd24c8d0dd9a1e57395b603f51"
 
 [[package]]
+name = "bit-vec"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5727b15fa97d4f4fee0a3b7c3d550ed0269f54329207b86388de918604e31269"
+dependencies = [
+ "borsh",
+ "serde",
+]
+
+[[package]]
 name = "bit_field"
 version = "0.10.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e4b40c7323adcfc0a41c4b88143ed58346ff65a288fc144329c5c45e05d70c6"
+
+[[package]]
+name = "bite-gp-collections"
+version = "1.23.301"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a717885c49855edf0b87573c2f7ad43bdc3090b262bf4e0dc2a284457ec6c7fb"
+dependencies = [
+ "bite-gp-gpui-util",
+ "indexmap",
+ "rustc-hash 2.1.3",
+]
+
+[[package]]
+name = "bite-gp-derive-refineable"
+version = "1.23.301"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8dd5bb931a4c06923601f421fffb57e6a98fcc67ed3e39bb8cb03b418341f2b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "bite-gp-engine"
+version = "1.23.301"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1982ba3206ea3957f5fca0146bb0475d3565393ceeccc18b3fe89658ea6e9260"
+dependencies = [
+ "anyhow",
+ "bite-gp-collections",
+ "bite-gp-refineable",
+ "bite-gp-shared-string",
+ "bite-gp-types",
+ "core-video",
+ "derive_more",
+ "etagere",
+ "log",
+ "parking_lot",
+ "profiling",
+ "schemars",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "windows 0.62.2",
+]
+
+[[package]]
+name = "bite-gp-gpui-util"
+version = "1.23.301"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93389971b0e46a8e5e494570a20004f0b16982764b01460a1d1a99c101e7a1a6"
+dependencies = [
+ "anyhow",
+ "log",
+ "which",
+]
+
+[[package]]
+name = "bite-gp-morphorm"
+version = "1.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "763c8214b4f462f32de6ebad4b326be42499982c8bfd09c4bace62d95748581c"
+dependencies = [
+ "bite-gp-engine",
+ "bite-gp-types",
+ "morphorm",
+]
+
+[[package]]
+name = "bite-gp-refineable"
+version = "1.23.301"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89261f53de05bc93991650c713e775d47cf56b1d8f7785ac1e6a592abdd8d157"
+dependencies = [
+ "bite-gp-derive-refineable",
+]
+
+[[package]]
+name = "bite-gp-shared-string"
+version = "1.23.301"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b6f4a915f072216f8ea8b419717a15b15c101497dbae4be831b3cf157922966"
+dependencies = [
+ "schemars",
+ "serde",
+ "smol_str",
+]
+
+[[package]]
+name = "bite-gp-types"
+version = "1.23.301"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f73624c06dc8c90f1e9fe67a2130ba3fcf2e4119ed75d6747559341f0056759"
+dependencies = [
+ "anyhow",
+ "bite-gp-refineable",
+ "derive_more",
+ "schemars",
+ "serde",
+ "taffy",
+]
 
 [[package]]
 name = "bitflags"
@@ -670,8 +776,22 @@ version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "553c5d846a6ba5150c65e3b1b8ec073bcf1abc20f9b7220de384a4443ea4e20a"
 dependencies = [
+ "borsh-derive",
  "bytes",
  "cfg_aliases",
+]
+
+[[package]]
+name = "borsh-derive"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12cdfe656708a01f89b451a7d36466e6fe6c414de0aa18fc54f864f6f9ca9f56"
+dependencies = [
+ "once_cell",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -735,13 +855,13 @@ dependencies = [
 
 [[package]]
 name = "calloop"
-version = "0.14.3"
-source = "git+https://github.com/zed-industries/calloop#3759371fee14c40066d64777e2a36b6ffcc22590"
+version = "0.14.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "43b32313e937c8721c9d17ee9bf60699a6402b4b7c2cb6ac1bee0ffcaa4b4e5e"
 dependencies = [
  "bitflags 2.13.2",
  "polling",
  "rustix",
- "slab",
  "tracing",
 ]
 
@@ -824,6 +944,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ced0551234e87afee12411d535648dd89d2e7f34c78b753395567aff3d447ff"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "chacha20"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -935,7 +1066,6 @@ dependencies = [
 [[package]]
 name = "collections"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "gpui_util",
  "indexmap",
@@ -1198,6 +1328,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpufeatures"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1304,7 +1443,6 @@ dependencies = [
 [[package]]
 name = "derive_refineable"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1514,9 +1652,9 @@ dependencies = [
 
 [[package]]
 name = "equivalent"
-version = "1.0.2"
+version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
+checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "erased-serde"
@@ -1712,9 +1850,9 @@ dependencies = [
 
 [[package]]
 name = "font-types"
-version = "0.12.6"
+version = "0.12.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c92d9081c7ab3bd83ef1eecdfad090f3d966e3ce74106779664114cfe1a6274"
+checksum = "835ae9d781464a79026cde387f9cbc650c9a4909d7cf7e658b127e3c35d2f35d"
 dependencies = [
  "bytemuck",
 ]
@@ -1958,6 +2096,7 @@ dependencies = [
  "js-sys",
  "libc",
  "r-efi 6.0.0",
+ "rand_core 0.10.1",
  "wasm-bindgen",
 ]
 
@@ -2052,8 +2191,8 @@ dependencies = [
 [[package]]
 name = "gpui"
 version = "0.2.2"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
+ "anyhow",
  "bindgen",
  "embed-resource",
  "gpui_authoring",
@@ -2071,7 +2210,6 @@ dependencies = [
 [[package]]
 name = "gpui_apple"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "block2 0.6.2",
@@ -2095,7 +2233,6 @@ dependencies = [
 [[package]]
 name = "gpui_authoring"
 version = "0.2.2"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2162,7 +2299,6 @@ dependencies = [
 [[package]]
 name = "gpui_engine"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "collections",
@@ -2185,7 +2321,6 @@ dependencies = [
 [[package]]
 name = "gpui_engine_default"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -2215,7 +2350,6 @@ dependencies = [
 [[package]]
 name = "gpui_linux"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -2262,7 +2396,6 @@ dependencies = [
 [[package]]
 name = "gpui_macos"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -2308,7 +2441,6 @@ dependencies = [
 [[package]]
 name = "gpui_macros"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -2319,7 +2451,6 @@ dependencies = [
 [[package]]
 name = "gpui_platform"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -2362,7 +2493,6 @@ dependencies = [
 [[package]]
 name = "gpui_runtime"
 version = "0.2.2"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "gpui_authoring",
@@ -2371,7 +2501,6 @@ dependencies = [
 [[package]]
 name = "gpui_shared_string"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "schemars",
  "serde",
@@ -2381,7 +2510,6 @@ dependencies = [
 [[package]]
 name = "gpui_types"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "derive_more",
@@ -2397,7 +2525,6 @@ dependencies = [
 [[package]]
 name = "gpui_util"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "log",
@@ -2431,6 +2558,7 @@ dependencies = [
 name = "gpui_video"
 version = "0.1.0"
 dependencies = [
+ "bite-gp-morphorm",
  "flume",
  "gpui",
  "gpui_authoring",
@@ -2440,6 +2568,7 @@ dependencies = [
  "gpui_wgpu",
  "image",
  "libc",
+ "log",
  "smallvec",
 ]
 
@@ -2453,7 +2582,6 @@ dependencies = [
 [[package]]
 name = "gpui_web"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -2482,7 +2610,6 @@ dependencies = [
 [[package]]
 name = "gpui_wgpu"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "ash",
@@ -2513,7 +2640,6 @@ dependencies = [
 [[package]]
 name = "gpui_windows"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -2686,7 +2812,6 @@ dependencies = [
 [[package]]
 name = "http_client"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -3356,6 +3481,15 @@ checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
  "simd-adler32",
+]
+
+[[package]]
+name = "morphorm"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0997abf77163b581acc08914106e206f6cc9eac30e4512b9a611dd8e6916b13"
+dependencies = [
+ "smallvec",
 ]
 
 [[package]]
@@ -4083,7 +4217,6 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "perf"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "collections",
  "serde",
@@ -4354,16 +4487,18 @@ dependencies = [
 
 [[package]]
 name = "proptest"
-version = "1.10.0"
-source = "git+https://github.com/proptest-rs/proptest?rev=3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b#3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b"
+version = "1.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8530004ccb15eae51c7e40009fbe317f341f804db54dc033eec1c50be28cfa0"
 dependencies = [
- "bit-set 0.8.0",
- "bit-vec 0.8.0",
+ "bit-set 0.11.1",
+ "bit-vec 0.10.1",
  "bitflags 2.13.2",
+ "chacha20",
+ "core_detect",
  "num-traits",
  "proptest-macro",
- "rand 0.9.5",
- "rand_chacha 0.9.0",
+ "rand 0.10.3",
  "rand_xorshift",
  "regex-syntax",
  "rusty-fork",
@@ -4373,13 +4508,14 @@ dependencies = [
 
 [[package]]
 name = "proptest-macro"
-version = "0.5.0"
-source = "git+https://github.com/proptest-rs/proptest?rev=3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b#3dca198a8fef1b32e3a66f1e1897c955b4dc5b5b"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e99782ea31698c2206c6887c1220d2f594b291c26cb9ec5b6d7cf175320bc212"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.9",
 ]
 
 [[package]]
@@ -4484,6 +4620,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c9fb96cbc91e3478eaae79a69fcd3f1ae4ad052e471fe6732fff548984b4af"
+dependencies = [
+ "getrandom 0.4.3",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_chacha"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4522,12 +4668,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "rand_xorshift"
-version = "0.4.0"
+name = "rand_core"
+version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
+checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_xorshift"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "60aa6af80be32871323012e02e6e65f8a7cc7890931ae421d217ad8fe0df2ccf"
 dependencies = [
- "rand_core 0.9.5",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -4657,7 +4809,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "046a7d674daf459825b32f5062056d6882db0d2f5a479fbd76ccfc870ac18709"
 dependencies = [
  "bytemuck",
- "font-types 0.12.6",
+ "font-types 0.12.7",
  "once_cell",
 ]
 
@@ -4709,7 +4861,6 @@ dependencies = [
 [[package]]
 name = "refineable"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "derive_refineable",
 ]
@@ -4884,7 +5035,6 @@ dependencies = [
 [[package]]
 name = "scheduler"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "async-task",
  "backtrace",
@@ -5109,7 +5259,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
- "cpufeatures",
+ "cpufeatures 0.2.17",
  "digest",
 ]
 
@@ -5326,7 +5476,6 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "sum_tree"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "heapless",
  "log",
@@ -5689,9 +5838,9 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tokio"
-version = "1.53.2"
+version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e95f91fcc7a621e8b030f6aa23c71fe9838ae2fb4d8118b75602a328f5144044"
+checksum = "ce3335fa71841cda333a58d7615b03901380ecf09d59b3296d21f8bbac0dde4e"
 dependencies = [
  "pin-project-lite",
 ]
@@ -5998,7 +6147,6 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 [[package]]
 name = "util_macros"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "perf",
  "quote",
@@ -7266,18 +7414,18 @@ checksum = "6df3dc4292935e51816d896edcd52aa30bc297907c26167fec31e2b0c6a32524"
 
 [[package]]
 name = "zerocopy"
-version = "0.8.62"
+version = "0.8.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86502bf56ac7c77571a32e2647bb2a15894565e981fb2a48d7bde2d91c965a9d"
+checksum = "e5fe1f8f1b06191a00962174c61aa5005e0bb391a6d80d07e24d115c01a92ed8"
 dependencies = [
  "zerocopy-derive",
 ]
 
 [[package]]
 name = "zerocopy-derive"
-version = "0.8.62"
+version = "0.8.63"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5457206954b06561e2608c7e19cf58b1926586d999c246eebe4502f7e2039d1a"
+checksum = "863ad3ac83293fb4d740aedbfdc9240dd8d1a50c1099acd76ce80ce7c7230c7f"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7367,7 +7515,6 @@ checksum = "b268e58e7c693d7c271f93ffc4ba3b380412554231c85bf61ca7af91042a4112"
 [[package]]
 name = "zlog"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "anyhow",
  "chrono",
@@ -7384,7 +7531,6 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "ztracing"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 dependencies = [
  "tracing",
  "tracing-subscriber",
@@ -7395,7 +7541,6 @@ dependencies = [
 [[package]]
 name = "ztracing_macro"
 version = "0.1.0"
-source = "git+https://github.com/bite-gpui/bite-gpui?branch=bite_v1.23.1-pre-interop-gpu_canvas#2cff25b66377096d1d37acb74c3e5c1d28bad11d"
 
 [[package]]
 name = "zune-core"
@@ -7462,6 +7607,11 @@ dependencies = [
  "syn 3.0.9",
  "winnow 1.0.4",
 ]
+
+[[patch.unused]]
+name = "calloop"
+version = "0.14.3"
+source = "git+https://github.com/zed-industries/calloop#3759371fee14c40066d64777e2a36b6ffcc22590"
 
 [[patch.unused]]
 name = "tree-sitter-language"

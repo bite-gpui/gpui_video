@@ -32,13 +32,22 @@ gpui_video_platform = { version = "0.1.0", path = "crates/gpui_video_platform" }
 # it. Development takes it from the sibling checkout; on release it becomes its published version.
 gpui_interop = { version = "0.1.0", path = "../gpui-interop/crates/gpui_interop" }
 
-# The core this stack is built on. Development takes it from its branch; on release each `git` and
-# `branch` pair is replaced by the core's published `version = "1.23"`, which a published crate has
-# to depend on instead of a git source.
-gpui = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas", default-features = false }
-gpui_authoring = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
-gpui_engine = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
-gpui_wgpu = { git = "https://github.com/bite-gpui/bite-gpui", branch = "bite_v1.23.1-pre-interop-gpu_canvas" }
+# The core, from the working tree next door — `bite-gpui`'s own checkout, so a fix in `gpui_wgpu`
+# (the dma-buf importer) reaches this stack without a release. Each key keeps its source name, and
+# the release preserves every `[lib] name` (`gpui`, `gpui_authoring`, `gpui_engine`, `gpui_wgpu`, …),
+# so every `use gpui::…` in the crates and examples keeps compiling unchanged. On release each path is
+# replaced by the core's published package — the `package = "bite-gp-…"` and `version = "1.23.301"`
+# form this file carried before.
+gpui = { path = "../bite-gpui/crates/gpui", default-features = false }
+gpui_authoring = { path = "../bite-gpui/crates/gpui_authoring" }
+gpui_engine = { path = "../bite-gpui/crates/gpui_engine" }
+gpui_wgpu = { path = "../bite-gpui/crates/gpui_wgpu" }
+
+# A layout engine to swap in for the bundled one, for the `grid` example's `morphorm` feature. It is
+# published against the *published* core, so the example opts into it through an off-by-default
+# feature rather than a working-tree build carrying it: see `[patch.crates-io]` below for why the
+# two cannot meet.
+gpui_morphorm = { package = "bite-gp-morphorm", version = "1.21" }
 
 # Third-party, at the versions the core resolves to, so one graph holds one copy of each.
 anyhow = "1.0.86"
@@ -82,7 +91,12 @@ windows = { version = "0.62", features = [
     "Win32_System_LibraryLoader",
 ] }
 
-# The core is developed against a few forked crates, and patches only apply from the root workspace,
+# `gpui_morphorm` is a *published* swap, built against the *published* core: its `gpui_engine`
+# dependency is the crates.io `bite-gp-engine`, which a `[patch]` cannot redirect to the next-door
+# `gpui_engine` because a patch matches by crates.io package name and the two differ. So the swap and
+# a working-tree core cannot coexist in one graph, and the `grid` example's morphorm arm is behind the
+# `gpui_video` crate's `morphorm` feature — off by default, so a working-tree build stays green. The
+# core is also developed against a few forked crates, and patches only apply from the root workspace,
 # so whichever repo builds it has to carry them.
 [patch.crates-io]
 tree-sitter-language = { git = "https://github.com/tree-sitter/tree-sitter", rev = "43623ec9bf0eaaf7113285c46e8a09018f181b18" }
