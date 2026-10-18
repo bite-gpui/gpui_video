@@ -22,6 +22,9 @@ test-support = []
 [target.'cfg(target_os = "linux")'.dependencies]
 anyhow.workspace = true
 gpui_engine.workspace = true
+# The adapter enumeration types: `supports_decode` and `decode_preference` answer which enumerated GPU
+# has a decoder, so an application can state that as a `GpuPreference` before the first window.
+gpui_platform.workspace = true
 # The GPU match: this names the window renderer's DRM node, so a surface is exported on the GPU the
 # renderer will sample it on rather than a node picked by hand.
 gpui_interop.workspace = true

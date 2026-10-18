@@ -107,6 +107,13 @@ div()
   `gpui_va` refuses the frame.
 - **The decoder and the renderer on the same GPU.** On a hybrid laptop that is the integrated GPU;
   pinning the renderer to a decoder-less discrete GPU leaves no hardware path at all.
+- **Choosing the GPU programmatically.** `gpui_va::decode_preference(Codec::H264)` is a
+  `GpuPreference::Custom` that selects the first enumerated adapter with a hardware decoder, before the
+  first window:
+  `gpui::application().with_gpu_preference(gpui_va::decode_preference(gpui_va::Codec::H264))`. If no
+  adapter decodes, the window names the shortfall; an application that would rather play in software
+  keeps `LowPower`/`Auto` and the CPU read-back path. Compose `gpui_va::supports_adapter` into a
+  predicate of your own when the choice has another requirement as well.
 - **System libraries.** On Debian or Ubuntu:
 
   ```sh
@@ -154,7 +161,10 @@ flowchart TD
 ### Zero-copy, in constant memory
 
 For each frame, `gpui_va` exports the VA-API surface as a `dma-buf`, preserving the driver's native
-tiling modifier; GPUI's renderer imports it and does the YUV-to-RGB conversion during compositing.
+tiling modifier. Before exporting, it checks that the descriptor is the 8-bit NV12 it can describe —
+the fourcc, the two layer formats, and that both planes fit inside the exported object — so a driver
+returning another format is a named refusal rather than a mislabeled surface. GPUI's renderer imports
+it and does the YUV-to-RGB conversion during compositing.
 
 To keep the decoder from overwriting a surface GPUI is still drawing, each exported handle carries a
 **release descriptor**: the renderer signals it from its submission-completion callback, and the
@@ -190,6 +200,7 @@ dependencies resolve from there:
 gpui           = { path = "../bite-gpui/crates/gpui", default-features = false }
 gpui_authoring = { path = "../bite-gpui/crates/gpui_authoring" }
 gpui_engine    = { path = "../bite-gpui/crates/gpui_engine" }
+gpui_platform  = { path = "../bite-gpui/crates/gpui_platform" }
 gpui_wgpu      = { path = "../bite-gpui/crates/gpui_wgpu" }
 gpui_interop   = { version = "0.1.0", path = "../gpui_interop/crates/gpui_interop" }
 ```

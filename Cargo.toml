@@ -41,6 +41,7 @@ gpui_interop = { version = "0.1.0", path = "../gpui_interop/crates/gpui_interop"
 gpui = { path = "../bite-gpui/crates/gpui", default-features = false }
 gpui_authoring = { path = "../bite-gpui/crates/gpui_authoring" }
 gpui_engine = { path = "../bite-gpui/crates/gpui_engine" }
+gpui_platform = { path = "../bite-gpui/crates/gpui_platform" }
 gpui_wgpu = { path = "../bite-gpui/crates/gpui_wgpu" }
 
 # A layout engine to swap in for the bundled one, for the `grid` example's `morphorm` feature. It is

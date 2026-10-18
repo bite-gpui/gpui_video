@@ -21,6 +21,25 @@
 //! renderer converts the bytes with the stream's own matrix and range rather than one assumed.
 //!
 //! `libva` and `libavcodec` are opened at run time, so a machine without them builds and skips.
+//!
+//! # Choosing a GPU that can decode
+//!
+//! The renderer's GPU is chosen before the first window, and a dma-buf is importable only on the GPU
+//! it was exported from, so the decoder has to follow the renderer. [`supports_decode`] answers
+//! whether an enumerated adapter has a hardware decoder for a [`Codec`], which is what lets an
+//! application pick the GPU *and* keep hardware playback:
+//!
+//! ```ignore
+//! use gpui_va::{Codec, decode_preference};
+//!
+//! let app = gpui::application().with_gpu_preference(decode_preference(Codec::H264));
+//! ```
+//!
+//! A device type cannot answer this: an NVIDIA GM108 (a GeForce 930M or 940M) is a discrete GPU with
+//! a VA driver and **no** decoder, so `HighPerformance` or a name match can select the one card that
+//! cannot play the stream. The probe reads the driver's `VLD` entrypoints on the adapter's own render
+//! node and creates no surface, so it is cheap enough for a `Custom` selector. Compose
+//! [`supports_adapter`] into a predicate of your own when the choice has another requirement as well.
 
 #![cfg(target_os = "linux")]
 
@@ -41,6 +60,91 @@ use gpui_engine::DmaBufHandle;
 /// rather than export a surface the consumer will refuse.
 fn render_node() -> Option<PathBuf> {
     gpui_interop::gpu_id().and_then(|gpu| gpu.render_node)
+}
+
+/// A codec this backend can decode.
+///
+/// Only H.264 is wired up today, matching [`Decoder`]; the enum exists so the capability answer has a
+/// codec to be about rather than a boolean that would have to guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Codec {
+    /// H.264 / AVC, across Baseline, Main and High profiles.
+    H264,
+}
+
+impl std::fmt::Display for Codec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::H264 => "H.264",
+        })
+    }
+}
+
+/// Whether `gpu` has a hardware decoder for `codec`.
+///
+/// This is the application-facing half of GPU selection. `App::enumerate_gpus` names the adapters a
+/// process could render on **before a window exists**, and this answers which of them can actually
+/// decode — the question `vainfo` answers for a human and a device type does not answer for a
+/// program. An entry-level Optimus part (an NVIDIA GM108) exposes a VA driver and no decoder at all,
+/// so `HighPerformance`, or a name match, can otherwise select the one GPU that cannot play video.
+///
+/// The answer comes from the driver's VA entrypoints on the adapter's own DRM render node. It is
+/// `false` when `libva` or its driver is unavailable, the node cannot be opened, or none of the
+/// codec's profiles offers the `VLD` entrypoint; a caller that gets `false` should fall back to the
+/// CPU path rather than export a surface the renderer cannot sample.
+///
+/// This is the primitive for a producer that already holds a [`GpuId`](gpui_interop::GpuId). An
+/// application choosing before a window usually wants [`decode_preference`] or
+/// [`supports_adapter`], which start from the enumerated adapter.
+pub fn supports_decode(gpu: &gpui_interop::GpuId, codec: Codec) -> bool {
+    let Some(node) = gpu.render_node.as_deref() else {
+        log::debug!("gpui_va: {} names no DRM render node to probe", gpu.name);
+        return false;
+    };
+    va::supports_decode(node, codec)
+}
+
+/// Whether an adapter from `App::enumerate_gpus` has a hardware decoder for `codec`.
+///
+/// The adapter form of [`supports_decode`], for the list the application sees **before a window
+/// exists**. It is the predicate [`decode_preference`] is built from, and the one to compose with
+/// another requirement (say, a dma-buf-capable adapter) into a custom selection.
+///
+/// `false` when the adapter reports no DRM render node — the identity a VA display needs — or when
+/// the probe on that node finds no decoder.
+pub fn supports_adapter(info: &gpui_platform::GpuAdapterInfo, codec: Codec) -> bool {
+    let Some(gpui_platform::SessionGpuId::Drm { render_minor }) = info.id.session else {
+        log::debug!(
+            "gpui_va: {} reports no DRM render node, so it has no VA device to probe",
+            info.name
+        );
+        return false;
+    };
+    va::supports_decode(
+        &PathBuf::from(format!("/dev/dri/renderD{render_minor}")),
+        codec,
+    )
+}
+
+/// A preference selecting the first enumerated adapter with a hardware decoder for `codec`.
+///
+/// The application-side one-liner: the GPU is chosen for the functionality it has, before the first
+/// window, rather than by device type. If no adapter can decode, the selector returns `None` and the
+/// window fails naming the shortfall — what "this application requires hardware decode" should mean.
+/// An application that would rather play in software keeps `LowPower`/`Auto` and uses the CPU
+/// read-back path instead.
+///
+/// ```ignore
+/// use gpui_va::{Codec, decode_preference};
+///
+/// let app = gpui::application().with_gpu_preference(decode_preference(Codec::H264));
+/// ```
+pub fn decode_preference(codec: Codec) -> gpui_platform::GpuPreference {
+    gpui_platform::GpuPreference::Custom(Arc::new(move |adapters| {
+        adapters
+            .iter()
+            .position(|adapter| supports_adapter(adapter, codec))
+    }))
 }
 
 /// A VA-API surface, kept alive for as long as the renderer samples its dma-buf.
@@ -2776,6 +2880,7 @@ mod va {
 
     use std::ffi::c_void;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::path::Path;
 
     use gpui_engine::{DmaBufHandle, DmaBufPlane, SurfaceFormatKind};
     use libloading::Library;
@@ -2833,6 +2938,21 @@ mod va {
     const VA_EXPORT_SURFACE_READ_ONLY: u32 = 0x1;
     const VA_EXPORT_SURFACE_SEPARATE_LAYERS: u32 = 0x4;
 
+    // The profiles H.264 decoding can arrive under, and the entrypoint that means "decode".
+    const VA_PROFILE_H264_BASELINE: i32 = 5;
+    const VA_PROFILE_H264_MAIN: i32 = 6;
+    const VA_PROFILE_H264_HIGH: i32 = 7;
+    const VA_PROFILE_H264_CONSTRAINED_BASELINE: i32 = 19;
+    const VA_ENTRYPOINT_VLD: u32 = 1;
+    /// Plenty for a driver's entrypoint list; a longer one is simply not read past this.
+    const MAX_ENTRYPOINTS: usize = 16;
+
+    // The DRM layer formats an NV12 surface exports: one 8-bit luma plane and one interleaved
+    // chroma pair. `fourcc_code` from `drm_fourcc.h`.
+    const DRM_FORMAT_R8: u32 = 0x2020_3852;
+    const DRM_FORMAT_GR88: u32 = 0x3838_5247;
+    const DRM_FORMAT_RG88: u32 = 0x3838_4752;
+
     type GetDisplayDrm = unsafe extern "C" fn(i32) -> *mut c_void;
     type Initialize = unsafe extern "C" fn(*mut c_void, *mut i32, *mut i32) -> i32;
     type Terminate = unsafe extern "C" fn(*mut c_void) -> i32;
@@ -2849,6 +2969,7 @@ mod va {
     type DestroySurfaces = unsafe extern "C" fn(*mut c_void, *mut u32, i32) -> i32;
     type ExportSurfaceHandle =
         unsafe extern "C" fn(*mut c_void, u32, u32, u32, *mut RmDescriptor) -> i32;
+    type QueryConfigEntrypoints = unsafe extern "C" fn(*mut c_void, i32, *mut u32, *mut i32) -> i32;
 
     /// The VA display and the exported surface, kept alive while the renderer samples them.
     pub struct Producer {
@@ -2866,6 +2987,82 @@ mod va {
                 (self.destroy_surfaces)(self.display, &mut self.surface, 1);
                 (self.terminate)(self.display);
             }
+        }
+    }
+
+    /// Whether the VA driver on `node` offers a `VLD` entrypoint for `codec`, without creating a
+    /// surface.
+    pub fn supports_decode(node: &Path, codec: super::Codec) -> bool {
+        match unsafe { probe(node, codec) } {
+            Ok(supported) => supported,
+            Err(error) => {
+                log::debug!(
+                    "gpui_va: no {codec} decoder on {}: {error:#}",
+                    node.display()
+                );
+                false
+            }
+        }
+    }
+
+    unsafe fn probe(node: &Path, codec: super::Codec) -> anyhow::Result<bool> {
+        let va = unsafe { Library::new("libva.so.2") }?;
+        let drm = unsafe { Library::new("libva-drm.so.2") }?;
+        let get_display: GetDisplayDrm = unsafe { *drm.get(b"vaGetDisplayDRM\0")? };
+        let initialize: Initialize = unsafe { *va.get(b"vaInitialize\0")? };
+        let terminate: Terminate = unsafe { *va.get(b"vaTerminate\0")? };
+        let query: QueryConfigEntrypoints = unsafe { *va.get(b"vaQueryConfigEntrypoints\0")? };
+
+        let file = std::fs::File::open(node)
+            .map_err(|error| anyhow::anyhow!("opening {}: {error}", node.display()))?;
+        let display = unsafe { get_display(file.as_raw_fd()) };
+        if display.is_null() {
+            anyhow::bail!("no VA display on {}", node.display());
+        }
+        let mut major = 0;
+        let mut minor = 0;
+        anyhow::ensure!(
+            unsafe { initialize(display, &mut major, &mut minor) } == 0,
+            "vaInitialize failed on {}",
+            node.display()
+        );
+        let _terminated = DisplayGuard { display, terminate };
+
+        for profile in profiles(codec) {
+            let mut entrypoints = [0u32; MAX_ENTRYPOINTS];
+            let mut count = entrypoints.len() as i32;
+            if unsafe { query(display, *profile, entrypoints.as_mut_ptr(), &mut count) } != 0 {
+                continue;
+            }
+            let count = usize::try_from(count).unwrap_or(0).min(entrypoints.len());
+            if entrypoints[..count].contains(&VA_ENTRYPOINT_VLD) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The VA profiles a codec can appear under, most capable first.
+    fn profiles(codec: super::Codec) -> &'static [i32] {
+        match codec {
+            super::Codec::H264 => &[
+                VA_PROFILE_H264_HIGH,
+                VA_PROFILE_H264_MAIN,
+                VA_PROFILE_H264_CONSTRAINED_BASELINE,
+                VA_PROFILE_H264_BASELINE,
+            ],
+        }
+    }
+
+    /// Terminates a VA display on every path, including an early `?`.
+    struct DisplayGuard {
+        display: *mut c_void,
+        terminate: Terminate,
+    }
+
+    impl Drop for DisplayGuard {
+        fn drop(&mut self) {
+            unsafe { (self.terminate)(self.display) };
         }
     }
 
@@ -2943,6 +3140,110 @@ mod va {
         Ok((producer, handle))
     }
 
+    /// The handle fields a descriptor yields, checked against the object it names.
+    ///
+    /// Kept apart from taking the file descriptors so the layout rules can be tested without a
+    /// driver: these are exactly the numbers a producer hands the renderer, and every refusal below
+    /// is a frame the importer would otherwise drop — or, for a wrong format, sample from the wrong
+    /// place.
+    #[derive(Debug, PartialEq, Eq)]
+    struct ExportedLayout {
+        width: u32,
+        height: u32,
+        modifier: u64,
+        luma: (u64, u32),
+        chroma: (u64, u32),
+    }
+
+    fn checked_layout(descriptor: &RmDescriptor) -> anyhow::Result<ExportedLayout> {
+        anyhow::ensure!(
+            descriptor.fourcc == VA_FOURCC_NV12,
+            "vaExportSurfaceHandle returned fourcc {:#010x}, not NV12; this producer exports only \
+             8-bit NV12",
+            descriptor.fourcc
+        );
+        anyhow::ensure!(
+            descriptor.width > 0 && descriptor.height > 0,
+            "the descriptor is {}x{}",
+            descriptor.width,
+            descriptor.height
+        );
+        anyhow::ensure!(
+            descriptor.width.is_multiple_of(2) && descriptor.height.is_multiple_of(2),
+            "NV12 needs even dimensions, but the descriptor is {}x{}",
+            descriptor.width,
+            descriptor.height
+        );
+        anyhow::ensure!(
+            descriptor.num_objects == 1,
+            "expected one exported object, got {}",
+            descriptor.num_objects
+        );
+        anyhow::ensure!(
+            descriptor.num_layers == 2,
+            "NV12 has two layers, but the descriptor carries {}",
+            descriptor.num_layers
+        );
+
+        let object = descriptor.objects[0];
+        anyhow::ensure!(object.fd >= 0, "the exported object has no file descriptor");
+        anyhow::ensure!(object.size > 0, "the exported object is empty");
+
+        let luma = descriptor.layers[0];
+        let chroma = descriptor.layers[1];
+        anyhow::ensure!(
+            (luma.num_planes, chroma.num_planes) == (1, 1),
+            "expected one plane per layer, got {} and {}",
+            luma.num_planes,
+            chroma.num_planes
+        );
+        for (name, layer) in [("luma", luma), ("chroma", chroma)] {
+            anyhow::ensure!(
+                layer.object_index[0] == 0,
+                "the {name} plane is in object {}, but one object was exported",
+                layer.object_index[0]
+            );
+            anyhow::ensure!(
+                layer.pitch[0] >= descriptor.width,
+                "the {name} pitch is {}, narrower than a {}-wide row",
+                layer.pitch[0],
+                descriptor.width
+            );
+        }
+        anyhow::ensure!(
+            luma.drm_format == DRM_FORMAT_R8,
+            "the luma layer is {:#010x}, not DRM_FORMAT_R8",
+            luma.drm_format
+        );
+        anyhow::ensure!(
+            matches!(chroma.drm_format, DRM_FORMAT_GR88 | DRM_FORMAT_RG88),
+            "the chroma layer is {:#010x}, not an interleaved 8-bit pair",
+            chroma.drm_format
+        );
+
+        let luma_end =
+            u64::from(luma.offset[0]) + u64::from(luma.pitch[0]) * u64::from(descriptor.height);
+        let chroma_end = u64::from(chroma.offset[0])
+            + u64::from(chroma.pitch[0]) * u64::from(descriptor.height / 2);
+        let size = u64::from(object.size);
+        anyhow::ensure!(
+            luma_end <= size,
+            "the luma plane ends at byte {luma_end}, past the {size}-byte object"
+        );
+        anyhow::ensure!(
+            chroma_end <= size,
+            "the chroma plane ends at byte {chroma_end}, past the {size}-byte object"
+        );
+
+        Ok(ExportedLayout {
+            width: descriptor.width,
+            height: descriptor.height,
+            modifier: object.drm_format_modifier,
+            luma: (u64::from(luma.offset[0]), luma.pitch[0]),
+            chroma: (u64::from(chroma.offset[0]), chroma.pitch[0]),
+        })
+    }
+
     /// Export `surface`, on `display`, as the dma-buf the renderer consumes.
     ///
     /// The display may be one this module made ([`produce`]) or ffmpeg's (see the crate's decode):
@@ -2963,28 +3264,128 @@ mod va {
             } == 0,
             "vaExportSurfaceHandle failed"
         );
-        anyhow::ensure!(
-            descriptor.num_objects == 1 && descriptor.num_layers == 2,
-            "expected one object of two layers, got {} of {}",
-            descriptor.num_objects,
-            descriptor.num_layers
-        );
-        let object = descriptor.objects[0];
-        let luma = descriptor.layers[0];
-        let chroma = descriptor.layers[1];
-        let fd = unsafe { OwnedFd::from_raw_fd(object.fd) };
+        let layout = checked_layout(&descriptor)?;
+        let fd = unsafe { OwnedFd::from_raw_fd(descriptor.objects[0].fd) };
         let chroma_fd = fd.try_clone()?;
         Ok(DmaBufHandle::new(
-            descriptor.width,
-            descriptor.height,
+            layout.width,
+            layout.height,
             SurfaceFormatKind::nv12(),
-            object.drm_format_modifier,
+            layout.modifier,
             [
-                DmaBufPlane::new(fd, u64::from(luma.offset[0]), luma.pitch[0]),
-                DmaBufPlane::new(chroma_fd, u64::from(chroma.offset[0]), chroma.pitch[0]),
+                DmaBufPlane::new(fd, layout.luma.0, layout.luma.1),
+                DmaBufPlane::new(chroma_fd, layout.chroma.0, layout.chroma.1),
             ],
             None,
         ))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// `VA_FOURCC('P','0','1','0')`: a 10-bit format this producer does not export.
+        const VA_FOURCC_P010: u32 = 0x3031_3050;
+
+        fn nv12_descriptor() -> RmDescriptor {
+            let width = 64u32;
+            let height = 32u32;
+            let mut descriptor = RmDescriptor {
+                fourcc: VA_FOURCC_NV12,
+                width,
+                height,
+                num_objects: 1,
+                ..RmDescriptor::default()
+            };
+            descriptor.objects[0] = RmObject {
+                fd: 0,
+                size: width * height + width * (height / 2),
+                drm_format_modifier: 0,
+            };
+            descriptor.num_layers = 2;
+            descriptor.layers[0] = RmLayer {
+                drm_format: DRM_FORMAT_R8,
+                num_planes: 1,
+                object_index: [0; 4],
+                offset: [0; 4],
+                pitch: [width, 0, 0, 0],
+            };
+            descriptor.layers[1] = RmLayer {
+                drm_format: DRM_FORMAT_GR88,
+                num_planes: 1,
+                object_index: [0; 4],
+                offset: [width * height, 0, 0, 0],
+                pitch: [width, 0, 0, 0],
+            };
+            descriptor
+        }
+
+        #[test]
+        fn a_canonical_nv12_descriptor_is_accepted() {
+            let layout = checked_layout(&nv12_descriptor()).expect("a canonical export");
+            assert_eq!(layout.width, 64);
+            assert_eq!(layout.height, 32);
+            assert_eq!(layout.modifier, 0);
+            assert_eq!(layout.luma, (0, 64));
+            assert_eq!(layout.chroma, (64 * 32, 64));
+        }
+
+        #[test]
+        fn a_descriptor_of_another_pixel_format_is_refused() {
+            let mut descriptor = nv12_descriptor();
+            descriptor.fourcc = VA_FOURCC_P010;
+            let error =
+                checked_layout(&descriptor).expect_err("P010 is not this producer's format");
+            assert!(error.to_string().contains("NV12"), "{error}");
+        }
+
+        #[test]
+        fn a_chroma_plane_past_the_object_is_refused() {
+            let mut descriptor = nv12_descriptor();
+            descriptor.layers[1].offset[0] = descriptor.objects[0].size;
+            let error = checked_layout(&descriptor).expect_err("chroma past the object");
+            assert!(error.to_string().contains("chroma plane ends"), "{error}");
+        }
+
+        #[test]
+        fn a_pitch_narrower_than_the_row_is_refused() {
+            let mut descriptor = nv12_descriptor();
+            descriptor.layers[0].pitch[0] = 32;
+            let error = checked_layout(&descriptor).expect_err("a half-width luma pitch");
+            assert!(error.to_string().contains("luma pitch"), "{error}");
+        }
+
+        #[test]
+        fn more_than_one_object_is_refused() {
+            let mut descriptor = nv12_descriptor();
+            descriptor.num_objects = 2;
+            let error = checked_layout(&descriptor).expect_err("two objects");
+            assert!(error.to_string().contains("one exported object"), "{error}");
+        }
+
+        #[test]
+        fn a_plane_in_a_second_object_is_refused() {
+            let mut descriptor = nv12_descriptor();
+            descriptor.layers[1].object_index[0] = 1;
+            let error = checked_layout(&descriptor).expect_err("chroma in another object");
+            assert!(error.to_string().contains("object 1"), "{error}");
+        }
+
+        #[test]
+        fn an_odd_extent_is_refused() {
+            let mut descriptor = nv12_descriptor();
+            descriptor.width = 63;
+            let error = checked_layout(&descriptor).expect_err("an odd width cannot be 4:2:0");
+            assert!(error.to_string().contains("even dimensions"), "{error}");
+        }
+
+        #[test]
+        fn a_layer_that_is_not_eight_bit_interleaved_is_refused() {
+            let mut descriptor = nv12_descriptor();
+            descriptor.layers[1].drm_format = DRM_FORMAT_R8;
+            let error = checked_layout(&descriptor).expect_err("a plane, not an interleaved pair");
+            assert!(error.to_string().contains("interleaved"), "{error}");
+        }
     }
 }
 
@@ -3120,6 +3521,86 @@ mod tests {
         {
             gpui_interop::remember(device.gpu_id());
         }
+    }
+
+    /// The capability probe and the decoder agree on the same render node: the 930M offers a VA
+    /// driver with no H.264 `VLD` entrypoint and decodes nothing in hardware, while the Intel HD 520
+    /// offers one and decodes the fixture. That agreement is the question an application asks before
+    /// it picks a renderer.
+    #[test]
+    fn the_decode_capability_probe_agrees_with_the_decoder() {
+        seed_gpu();
+        let Some(gpu) = gpui_interop::gpu_id() else {
+            eprintln!("skipping: no GPU reports a render node");
+            return;
+        };
+        if Decoder::open().is_none() {
+            eprintln!("skipping: libavcodec of the declared ABI is unavailable");
+            return;
+        }
+        let supported = supports_decode(&gpu, Codec::H264);
+        let decoded = decode(FIXTURE).is_some();
+        assert_eq!(
+            supported, decoded,
+            "the probe says {supported} but the decoder says {decoded} on {}",
+            gpu.name
+        );
+    }
+
+    /// The adapter enumeration path: a node nothing answers and an adapter with no node are both
+    /// refused, and a preference built from them selects nothing. No GPU is needed.
+    #[test]
+    fn the_adapter_probe_refuses_nodes_it_cannot_open() {
+        fn adapter(
+            name: &str,
+            session: Option<gpui_platform::SessionGpuId>,
+        ) -> gpui_platform::GpuAdapterInfo {
+            gpui_platform::GpuAdapterInfo::new(
+                gpui_platform::GpuId {
+                    permanent: gpui_platform::PermanentGpuId::Pci {
+                        vendor_id: Some(0x10de),
+                        device_id: 0x1346,
+                        subsys_id: None,
+                        revision: None,
+                    },
+                    session,
+                },
+                name,
+                gpui_platform::GpuDeviceType::Discrete,
+                gpui_platform::GpuBackend::Vulkan,
+                false,
+            )
+        }
+
+        let missing = adapter(
+            "absent",
+            Some(gpui_platform::SessionGpuId::Drm { render_minor: 9999 }),
+        );
+        assert!(!supports_adapter(&missing, Codec::H264));
+        let nameless = adapter("no node", None);
+        assert!(!supports_adapter(&nameless, Codec::H264));
+
+        let gpui_platform::GpuPreference::Custom(selector) = decode_preference(Codec::H264) else {
+            panic!("decode_preference is a custom selector");
+        };
+        assert_eq!(selector(&[]), None);
+        assert_eq!(selector(&[missing, nameless]), None);
+    }
+
+    /// A render node that does not exist is a refusal, not a panic: the probe runs in a preference
+    /// predicate, where a misconfigured adapter must not take the application down.
+    #[test]
+    fn the_decode_capability_probe_refuses_a_missing_node() {
+        let gpu = gpui_interop::GpuId {
+            name: "absent".to_owned(),
+            render_node: Some(PathBuf::from("/dev/dri/renderD9999")),
+        };
+        assert!(!supports_decode(&gpu, Codec::H264));
+        let nameless = gpui_interop::GpuId {
+            name: "no node".to_owned(),
+            render_node: None,
+        };
+        assert!(!supports_decode(&nameless, Codec::H264));
     }
 
     /// Signal a handle's release descriptor, as the renderer does once it has finished with a frame.

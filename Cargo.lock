@@ -2543,6 +2543,7 @@ dependencies = [
  "gpui",
  "gpui_engine",
  "gpui_interop",
+ "gpui_platform",
  "gpui_video_platform",
  "gpui_wgpu",
  "libc",
