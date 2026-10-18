@@ -2942,7 +2942,7 @@ mod va {
     const VA_PROFILE_H264_BASELINE: i32 = 5;
     const VA_PROFILE_H264_MAIN: i32 = 6;
     const VA_PROFILE_H264_HIGH: i32 = 7;
-    const VA_PROFILE_H264_CONSTRAINED_BASELINE: i32 = 19;
+    const VA_PROFILE_H264_CONSTRAINED_BASELINE: i32 = 13;
     const VA_ENTRYPOINT_VLD: u32 = 1;
     /// Plenty for a driver's entrypoint list; a longer one is simply not read past this.
     const MAX_ENTRYPOINTS: usize = 16;
