@@ -30,7 +30,7 @@ gpui_video_platform = { version = "0.1.0", path = "crates/gpui_video_platform" }
 
 # The producer-side surface crate: a `gpui_va` decoder lands on the window renderer's GPU through
 # it. Development takes it from the sibling checkout; on release it becomes its published version.
-gpui_interop = { version = "0.1.0", path = "../gpui-interop/crates/gpui_interop" }
+gpui_interop = { version = "0.1.0", path = "../gpui_interop/crates/gpui_interop" }
 
 # The core, from the working tree next door — `bite-gpui`'s own checkout, so a fix in `gpui_wgpu`
 # (the dma-buf importer) reaches this stack without a release. Each key keeps its source name, and

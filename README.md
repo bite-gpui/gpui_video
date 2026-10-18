@@ -1,49 +1,113 @@
 # gpui_video
 
-Play hardware-decoded video directly inside a GPUI window without copying pixels through the CPU.
+Play hardware-decoded video directly inside a [GPUI](https://github.com/zed-industries/zed) window —
+on the GPU, with no CPU copy in the steady state.
 
-`gpui_video` provides a high-level video player element backed by a zero-copy GPU pipeline. A platform
-hardware decoder renders frames into GPU surfaces, exports them as OS handles (`dma-buf` on Linux), and
-passes them straight to GPUI's window renderer to sample on the GPU. Using it in a view takes a single
-line of code, complete with built-in playback controls:
+A hardware decoder renders frames into GPU surfaces, exports them as OS handles (`dma-buf` on Linux),
+and GPUI's renderer samples them in place. A video in a view is one element, with HTML5-shaped
+controls:
 
 ```rust
 use gpui_video::video;
 
-// Opens the hardware decoder, paces playback to the stream's timestamps, and renders playback controls.
-let picture = video().source("movie.mp4").controls(true);
+let picture = video()
+    .source("movie.mp4")
+    .controls(true);
 ```
+
+## Status
+
+- **Linux / VA-API** is the implemented backend (`gpui_va`). macOS (VideoToolbox / CoreVideo) and
+  Windows (Media Foundation) are designed to drop in behind the same API; neither is built.
+- The crates are **pre-release (`0.1.0`) and are not published under these names.** The `gpui-video`
+  name on crates.io is an unrelated project — do not depend on it. The published names are not
+  decided in this repository.
+- **The decoder must share the renderer's GPU.** A `dma-buf` is importable only on the GPU that
+  exported it, so the VA-API device and the `gpui_wgpu` renderer must be the same physical card.
 
 ## Crates
 
-| Crate | Description |
+| crate | what it is |
 | --- | --- |
-| `gpui_video` | The main library for applications: provides the `video()` element, `Source`, `Player`, frame pacing, and the default playback control bar. |
-| `gpui_va` | The Linux hardware decoder backend: decodes video via VA-API into driver-tiled NV12 GPU surfaces and exports each frame as a `dma-buf`. Dynamically loads `libva`, `libavcodec`, `libavutil`, `libavformat`, and `libswscale` at runtime. |
-| `gpui_video_platform` | Shared trait definitions (`SurfaceProducer`) that connect video decoders, capture pipelines, and external 3D renderers to the `video()` element. |
+| `gpui_video` | The library an application uses: the `video()` element, `Source`, `Player`, frame pacing and the default control bar. |
+| `gpui_va` | The Linux decoder: VA-API into driver-tiled NV12 GPU surfaces, exported as `dma-buf`s. It loads `libva`, `libavcodec`, `libavutil`, `libavformat` and `libswscale` at runtime. |
+| `gpui_video_platform` | `SurfaceProducer`, the one-method seam a decoder, a capture pipeline or a 3D renderer implements to feed the element. |
 
-Under the hood, this stack relies on [`gpui_interop`](https://github.com/bite-gpui/gpui_interop) to share
-textures and synchronization primitives with GPUI's window renderer.
+The surface transport underneath is [`gpui_interop`](https://github.com/bite-gpui/gpui_interop).
+
+## The element
+
+```rust
+use gpui_video::{Player, Source, video, video_controls};
+```
+
+`video()` returns an ordinary element — `Styled`, `IntoElement`, composited like any other child.
+The builder:
+
+- **`.source(impl Into<Source>)`** — the no-entity shape. The element opens the decoder on a
+  background thread, paces playback to the stream's timestamps, and keeps the player in an entity it
+  creates, so the default controls have something to read and drive. `Source` accepts a path
+  (`&str`, `String`) or an in-memory elementary stream (`&[u8]`, `Vec<u8>`).
+- **`.player(Entity<P>)`** where `P: Player` — the view is a face on an entity you own.
+  `cx.notify()` on the player repaints the view, and the default controls read that same entity.
+  `Player` is surface plus an **optional** transport (`play`, `pause`, `toggle`, `position`,
+  `duration`, `seek`, scrub); a player with no transport is simply always playing.
+- **`.producer(impl FnOnce() -> Box<dyn SurfaceProducer>)`** — own the producer directly, when there
+  is no entity. The factory is called every frame but used once, so the decoder survives across
+  frames. This shape has no transport, so it draws no default controls.
+- **`.controls(impl Into<Controls>)`** — `true` draws the default bar, `false` draws nothing, and an
+  element (for example `video_controls(player)`, or your own) is drawn in its place.
+- **`.overlay(impl IntoElement)`** — anything that is not a bottom bar, filling the picture's bounds.
+  It takes precedence over `controls` and is hit-tested first.
+- **`.object_fit(ObjectFit)`** — `Contain` (the default) letterboxes; `Fill` stretches.
+
+```rust
+// No player to manage.
+video().source("movie.mp4").controls(true)
+
+// An entity owns the player; the view is a face on it.
+video().player(player).controls(true)
+
+// Your own controls, or none.
+video().source(path).controls(video_controls(player))
+video().source(path).controls(false)
+```
+
+## Quick start
+
+From a checkout of this repository (see [Building from source](#building-from-source)):
+
+```sh
+cargo run -p gpui_video --example player            # the bundled clip
+cargo run -p gpui_video --example player -- movie.mp4
+```
+
+To put it in your own view, `video()` is an element, so it goes where any other child does:
+
+```rust
+use gpui_video::{Source, video};
+
+div()
+    .size_full()
+    .child(
+        video()
+            .source(Source::from("movie.mp4"))
+            .controls(true)
+            .flex_1()
+            .w_full(),
+    )
+```
 
 ## Requirements
 
-* **Linux:** Currently the only implemented platform backend. Support for macOS (`gpui_cv` via
-  VideoToolbox/CoreVideo) and Windows (`gpui_mf` via Media Foundation) is planned and designed to drop
-  into the existing `gpui_video` API without requiring application changes.
-* **Rust:** A recent toolchain supporting the 2024 edition.
-* **Hardware & Drivers:** A GPU with a **VA-API driver** for hardware decoding and a **Vulkan driver**
-  compatible with GPUI's `gpui_wgpu` renderer. Because decoded frames are shared as `dma-buf` handles,
-  the decoder and window renderer must run on the same physical GPU.
-* **A GPU that actually decodes:** a VA-API driver is necessary but not sufficient — a device can
-  expose one and still offer no decoding. An entry-level Optimus GPU such as an NVIDIA `GM108`
-  (GeForce 930M, 940M) has **no NVDEC engines** at all, so `nvidia-vaapi-driver` initialises but
-  reports zero supported profiles, FFmpeg falls back to software, and `gpui_va` refuses the frame.
-  Because a `dma-buf` is importable only on the GPU it was exported from, decoding has to run on the
-  **renderer's own GPU** — on a hybrid laptop that is the integrated one, and pinning the renderer to
-  a decoder-less discrete GPU leaves no hardware path at all. `vainfo`, or the driver's own profile
-  list, says which profiles a device offers.
-* **System dependencies:** Standard build tools, GUI libraries for GPUI, and `libva` / FFmpeg libraries
-  at runtime. On Debian or Ubuntu:
+- **Linux**, with a VA-API driver that actually decodes and a Vulkan driver for `gpui_wgpu`.
+  `vainfo` lists the profiles a device offers. A device can expose VA-API and still have no decoder
+  — an entry-level Optimus `GM108` (GeForce 930M, 940M) has no NVDEC engines, so
+  `nvidia-vaapi-driver` initialises but reports zero profiles, FFmpeg falls back to software, and
+  `gpui_va` refuses the frame.
+- **The decoder and the renderer on the same GPU.** On a hybrid laptop that is the integrated GPU;
+  pinning the renderer to a decoder-less discrete GPU leaves no hardware path at all.
+- **System libraries.** On Debian or Ubuntu:
 
   ```sh
   sudo apt-get install -y --no-install-recommends \
@@ -52,131 +116,107 @@ textures and synchronization primitives with GPUI's window renderer.
     libssl-dev libva-dev libvulkan1 libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev libzstd-dev
   ```
 
-  Because `gpui_va` loads `libva`, `libavcodec`, `libavutil`, `libavformat`, and `libswscale`
-  dynamically at runtime, the project will still compile and skip hardware-dependent tests on machines
-  without those libraries installed — though they are required to actually play video.
-
-## Quick start
-
-You can run the standalone player example right from the repository. With no arguments, it plays a
-bundled test clip; you can also pass a path to any media file supported by FFmpeg (`libavformat`):
-
-```sh
-cargo run -p gpui_video --example player
-cargo run -p gpui_video --example player -- path/to/movie.mp4
-```
-
-To embed a video player inside your own GPUI view:
-
-```rust
-use gpui_video::{Source, video};
-
-video()
-    .source(Source::from("movie.mp4"))
-    .controls(true)      // shows the default control bar; pass `false` to hide, or pass a custom element
-    .flex_1()
-    .w_full()
-```
-
-If you need programmatic control over playback, you can manage your own player entity and pass it to the
-element via `video().player(entity)`. The default control bar automatically binds to that entity, or you
-can build custom UI controls against the `Player` trait and headless `Transport` state (see the crate
-documentation for details).
+  `libva`, `libavcodec`, `libavutil`, `libavformat` and `libswscale` are loaded at runtime, so the
+  workspace compiles without them and hardware-dependent tests skip; they are required to play.
+- **Rust:** a toolchain supporting the 2024 edition.
 
 ## Examples
 
-| Example | Crate | Description |
+| example | crate | what it shows |
 | --- | --- | --- |
-| `player` | `gpui_video` | Full media player demo: runs hardware decoding off the main UI thread, paces frames to stream timestamps, displays an HTML5-style control bar, and preserves the video's native color space so color-graded footage renders accurately. |
-| `grid` | `gpui_video` | Multi-stream stress test: renders a grid of independent video decoders (playing staggered loops of the bundled clip by default) with live FPS and CPU/GPU metrics. Lets you toggle between zero-copy `dma-buf` rendering and CPU read-back on the fly to compare performance. |
-| `surface` | `gpui_va` | Low-level compositing demo: shows how to display external GPU buffers using both the `surface()` element and the `gpu_canvas` callback across every pixel format supported by the renderer. |
-| `readback_bench` | `gpui_va` | Head-to-head benchmark: decodes a video file using both the zero-copy `dma-buf` path and the traditional CPU read-back path, breaking down the time spent in GPU-to-CPU memory transfers versus software format conversion. |
+| `player` | `gpui_video` | The full player: hardware decoding off the UI thread, timestamp-paced frames, the HTML5-style control bar, and the video's native colour space preserved. |
+| `grid` | `gpui_video` | A multi-stream stress test: a grid of independent decoders with live FPS and CPU/GPU metrics, toggling between zero-copy `dma-buf` and CPU read-back. |
+| `surface` | `gpui_va` | Every way to composite pixels GPUI did not draw, through both `surface()` and `gpu_canvas`, across the formats the renderer supports. |
+| `readback_bench` | `gpui_va` | Zero-copy `dma-buf` versus CPU read-back, breaking down the GPU-to-CPU transfer and the software conversion. |
 
 ```sh
 cargo run -p gpui_video --example player
-cargo run -p gpui_video --example grid                         # 16x16 grid using zero-copy dma-buf
-cargo run -p gpui_video --example grid -- --readback           # start in CPU read-back mode for comparison
-cargo run -p gpui_video --example grid -- --cols 4 --rows 4    # run a 4x4 video wall
+cargo run -p gpui_video --example grid                          # zero-copy dma-buf grid
+cargo run -p gpui_video --example grid -- --readback            # start in CPU read-back mode
+cargo run -p gpui_video --example grid -- --cols 4 --rows 4     # a 4x4 wall
 cargo run -p gpui_va    --example surface
+cargo run -p gpui_va    --example surface -- --tab 2            # open on a given format tab
 cargo run --release -p gpui_va --example readback_bench -- movie.mp4 300
 ```
 
-## How it works under the hood
+## How it works
 
 ```mermaid
 flowchart TD
-    S[Video file or stream] --> V[gpui_va: Hardware VA-API decode]
+    S[Video file or stream] --> V[gpui_va: hardware VA-API decode]
     V --> F[Decoded NV12 GPU surface]
-    F --> D[Exported as dma-buf with DRM format modifier]
-    D --> E[video element: SurfaceSource]
-    E --> R[GPUI renderer imports dma-buf and converts YUV to RGB on GPU]
-    R --> W[Composited into GPUI window]
+    F --> D[Exported as a dma-buf with its DRM modifier]
+    D --> E[video element: a SurfaceSource]
+    E --> R[GPUI renderer imports it and converts YUV to RGB on the GPU]
+    R --> W[Composited into the GPUI window]
 ```
 
-### Zero-copy frame lifecycle and constant memory
+### Zero-copy, in constant memory
 
-For each decoded frame, `gpui_va` exports the underlying VA-API surface as a `dma-buf` handle
-(preserving the GPU driver's native tiling modifier). GPUI's renderer imports that `dma-buf` directly
-and performs YUV-to-RGB color conversion on the GPU during compositing.
+For each frame, `gpui_va` exports the VA-API surface as a `dma-buf`, preserving the driver's native
+tiling modifier; GPUI's renderer imports it and does the YUV-to-RGB conversion during compositing.
 
-To prevent the decoder from overwriting a surface while GPUI is still drawing it, every exported frame
-handle includes a **release descriptor**:
+To keep the decoder from overwriting a surface GPUI is still drawing, each exported handle carries a
+**release descriptor**: the renderer signals it from its submission-completion callback, and the
+decoder waits for that signal before returning the surface to its pool. A small fixed pool,
+synchronised with the renderer, is why an arbitrarily long stream plays in **constant GPU memory**
+without tearing or buffering the file.
 
-1. When GPUI's renderer finishes sampling the frame on the GPU, its submission completion callback
-   signals the release descriptor.
-2. The decoder waits for that signal before returning the VA-API surface back to its internal decode
-   pool.
+### Colour
 
-Because the decoder recycles a small, fixed pool of hardware surfaces synchronized with the renderer,
-`gpui_video` can play arbitrarily long streams in **constant GPU memory** without tearing or buffering
-the entire file.
+`gpui_va` reads the stream's colour matrix and range and attaches them to each handle; the shader
+uses them for the YUV-to-RGB conversion. When a file omits the metadata it falls back to broadcast
+convention: limited range, BT.601 at 576 lines and below, BT.709 above.
 
-### Accurate color spaces
+## Limitations
 
-`gpui_va` inspects the video stream's color matrix and range metadata and attaches them to each frame's
-handle. GPUI's shader uses that metadata during YUV-to-RGB conversion so color-graded footage looks
-exactly as intended. If a video file omits color metadata, `gpui_va` falls back to standard broadcast
-conventions: limited color range, using **BT.601** for standard definition (576 lines and below) and
-**BT.709** above that.
+- **No transfer function yet.** The colour pipeline models a matrix and a range but not the transfer
+  function, so an sRGB-encoded producer's bytes are sampled as linear. Tracked as
+  [issue 0013](https://github.com/bite-gpui/bite-gpui-project/blob/main/issues/0013-transfer-function-and-srgb-sampling.md).
+- **Same GPU only.** On a measured Intel + NVIDIA pair a `dma-buf` exported on one device is refused
+  on the other on every memory type; the portable modifier is linear, and a tiled buffer does not
+  cross vendors.
+- **Linux only.** The macOS and Windows backends are designed but not built.
+- **Software decoding is refused, not silently used.** A frame FFmpeg fell back to software for is
+  rejected, so a machine with no decoder shows nothing rather than a slow path.
 
-## Using with `bite-gpui` 1.23.301
+## Building from source
 
-This workspace pulls GPUI from `crates.io` rather than a git branch. In `Cargo.toml`, the published
-`bite-gpui` packages are aliased back to their standard crate names so imports like `use gpui::...` and
-`use gpui_authoring::...` compile unchanged:
+The crates are not published, and the workspace develops against its siblings rather than crates.io.
+Check out `bite-gpui`, `gpui_interop` and `gpui_video` side by side; the workspace's path
+dependencies resolve from there:
 
 ```toml
-[workspace.dependencies]
-gpui           = { package = "bite-gpui",         version = "1.23.301", default-features = false }
-gpui_authoring = { package = "bite-gp-authoring", version = "1.23.301" }
-gpui_engine    = { package = "bite-gp-engine",    version = "1.23.301" }
-gpui_wgpu      = { package = "bite-gp-wgpu",      version = "1.23.301" }
+gpui           = { path = "../bite-gpui/crates/gpui", default-features = false }
+gpui_authoring = { path = "../bite-gpui/crates/gpui_authoring" }
+gpui_engine    = { path = "../bite-gpui/crates/gpui_engine" }
+gpui_wgpu      = { path = "../bite-gpui/crates/gpui_wgpu" }
+gpui_interop   = { version = "0.1.0", path = "../gpui_interop/crates/gpui_interop" }
 ```
 
-To test against a local checkout or a custom GPUI branch, replace those version entries with `path` or
-`git`/`branch` sources.
+Each path becomes the published package at release; `Cargo.toml` carries the exact substitution.
 
-## Running the tests
+## Tests
 
 ```sh
-# Build the workspace and run hardware-independent unit tests (used in CI):
+# Build the workspace and run the hardware-independent tests (what CI runs):
 cargo check --workspace --all-targets
 cargo test  --workspace --lib
 
-# Opt-in hardware integration test: decodes a frame on a real Vulkan/VA-API device,
-# exports a dma-buf surface, and verifies the pixels (skips automatically if no suitable GPU is present):
+# Opt-in: decode a frame on a real Vulkan/VA-API device, export a dma-buf, verify the pixels.
+# Skips automatically when no suitable GPU is present.
 cargo test -p gpui_va --features test-support
 ```
 
 ## Repository structure
 
 ```
-Cargo.toml                        Workspace configuration and bite-gpui dependencies
-crates/gpui_video/                High-level video() element, Player, frame pacing, and UI controls
-crates/gpui_va/                   Linux VA-API hardware decoder, test fixtures, and benchmarks
-crates/gpui_video_platform/       SurfaceProducer trait connecting decoders to GPUI elements
+Cargo.toml                    Workspace and the sibling-checkout dependencies
+crates/gpui_video/            The video() element, Player, pacing and the control bar
+crates/gpui_va/               The Linux VA-API decoder, fixtures and benchmarks
+crates/gpui_video_platform/   SurfaceProducer — the seam a producer implements
 ```
 
 ## License
 
-Licensed under the Apache-2.0 License. See the crate manifests for details.
+Apache-2.0. See the crate manifests.
